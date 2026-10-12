@@ -1,1 +1,5 @@
+yfinance
+pandas
+requests
+borsapy==0.10.0
 
