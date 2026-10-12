@@ -1,0 +1,42 @@
+name: bist-haftalik
+on:
+  schedule:
+    - cron: "30 6 * * 1"    # Pazartesi 09:30 TRT: haftalık takip listesi
+    - cron: "30 15 * * 5"   # Cuma 18:30 TRT: haftalık karne
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "otomatik, liste veya karne"
+        default: "otomatik"
+permissions:
+  contents: write
+concurrency:
+  group: bist-haftalik
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python haftalik.py "$MODE"
+        env:
+          MODE: ${{ inputs.mode || 'otomatik' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Haftalık kayıtları sakla
+        if: always()
+        run: |
+          git config user.name "bist-bot"
+          git config user.email "bist-bot@users.noreply.github.com"
+          git add -f weekly.csv weekly_results.csv 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "haftalik"
+            git pull --rebase
+            git push
+          fi
