@@ -6,8 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "canli veya test"
+        description: "canli, test veya rapor"
         default: "canli"
+permissions:
+  contents: write
 concurrency:
   group: bist-canli
   cancel-in-progress: false
@@ -31,3 +33,16 @@ jobs:
           TV_SESSION_SIGN: ${{ secrets.TV_SESSION_SIGN }}
           TV_USERNAME: ${{ secrets.TV_USERNAME }}
           TV_PASSWORD: ${{ secrets.TV_PASSWORD }}
+      - name: Uyarı kayıtlarını sakla
+        if: always()
+        run: |
+          if [ -f alerts.csv ]; then
+            git config user.name "bist-bot"
+            git config user.email "bist-bot@users.noreply.github.com"
+            git add alerts.csv
+            if ! git diff --staged --quiet; then
+              git commit -m "alerts"
+              git pull --rebase
+              git push
+            fi
+          fi
