@@ -23,7 +23,7 @@ SPREAD_MOVE_RATIO = 0.5 # fark, pencere hareketinin en fazla yarısı (işlem ma
 COOLDOWN_MIN = 60       # aynı hisse için iki bildirim arası (dk)
 START_MIN = 10 * 60 + 15  # açılış gürültüsü: 10:15'ten önce uyarı yok
 END_MIN = 17 * 60 + 40    # kapanışa yakın: 17:40'tan sonra uyarı yok
-MAX_ALERTS_PER_SESSION = 6
+MAX_ALERTS_PER_SESSION = 8
 INDEX_SYMBOL = "XU100"
 INDEX_MIN_CHANGE = -1.5 # endeks günlük bu seviyenin altındaysa uyarı yok (piyasa düşüşte)
 STOP_PCT = 2.0          # örnek stop (%) - ve ileri testte "stop" ölçütü
@@ -36,8 +36,30 @@ TIME_EXIT_MIN = 45      # bu kadar dk sonra hâlâ yukarı gitmediyse "momentum 
 STALE_SEC = 180         # bu kadar süre hiç veri gelmezse yeniden bağlan
 MAX_RECONNECTS = 5
 LOOP_WAIT = 5
+# --- ek kalıplar ---
+HIST_SEC = 35 * 60         # geçmiş fiyat hafızası
+BRK_LOOKBACK_MIN = 30      # kırılım: son 30 dk'ya bakılır (son 2 dk hariç)
+BRK_MIN_WATCH_MIN = 20     # kırılım: en az 20 dk veri toplanmış olmalı
+BRK_MAX_RANGE = 2.0        # kırılım: bekleme aralığı en fazla %2 genişlikte
+BRK_MARGIN = 0.3           # kırılım: aralığın en az %0,3 üstüne çıkmalı
+BRK_MIN_BURST = 2.0        # kırılım: hacim normalin en az 2 katı
+PB_MIN_DAY = 2.0           # geri dönüş: gün içinde en az %2 yükselmiş olmalı
+PB_MIN_DROP = 1.0          # geri dönüş: zirveden en az %1 geri çekilmiş
+PB_MAX_DROP = 4.0          # ... ama %4'ten fazla değil (çöküş olmasın)
+PB_MIN_BOUNCE = 0.4        # geri dönüş: dipten en az %0,4 toparlanmış
+PB_MIN_BURST = 1.5
+BOOK_RATIO = 3.0           # tahta: alış tarafı satış tarafının en az 3 katı
+BOOK_HOLD_SEC = 30         # ... ve bu durum en az 30 sn sürmüş
+BOOK_MIN_MOVE = 0.5        # tahta: son 5 dk'da en az %0,5 yükselmiş
+BOOK_MIN_BURST = 1.5
+PATTERN_NAMES = {"ivme": "Hızlı yükseliş", "kirilim": "Dar aralık kırılımı",
+                 "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı"}
+BLOCK_MIN_TL = 1_000_000   # tek güncellemede en az bu kadar TL'lik işlem = "blok" sayılır
+BLOCK_MIN_PCT_AVG = 8.0    # ve normal günlük hacmin en az bu kadar %'si
+BLOCK_COOLDOWN_MIN = 30    # aynı hisse için iki blok bildirimi arası (dk)
+MAX_BLOCKS_PER_SESSION = 10
 LOG_FILE = "alerts.csv"
-LOG_FIELDS = ["date", "time", "sym", "price", "move", "day", "burst", "spread", "bid_size",
+LOG_FIELDS = ["date", "time", "sym", "pattern", "price", "move", "day", "burst", "spread", "bid_size",
               "ask_size", "index", "stop", "target", "ret15", "ret30", "ret60", "ret_end",
               "mfe", "mae", "outcome"]
 
@@ -60,10 +82,13 @@ class Engine:
         self.out = out
         self.clock = clock or (lambda: CLOCK())
         self.cache = {t: {} for t in TICKERS}
-        self.ticks = {t: deque() for t in TICKERS}
+        self.hist = {t: deque() for t in TICKERS}
+        self.book_since = {}
         self.last_alert = {}
         self.last_tick = self.clock()
         self.alert_count = 0
+        self.block_count = 0
+        self.last_block = {}
         self.index_change = None
         self.active = []  # uyarı sonrası takip edilen kayıtlar
         self.lock = threading.Lock()
@@ -143,11 +168,163 @@ class Engine:
         return msgs
 
     def _handle(self, t, quote):
+        prev_vol = self.cache[t].get("volume")
+        prev_last = self.cache[t].get("last")
         entry = self._entry_check(t, quote)
         msgs = self._exits(t)
         if entry:
             msgs.append(entry)
+        block = self._block_check(t, prev_vol, prev_last)
+        if block:
+            msgs.append(block)
         return msgs
+
+    def _block_check(self, t, prev_vol, prev_last):
+        """Tek güncellemede çok büyük hacim gelip fiyat düşmediyse 'blok alım olabilir' der.
+        Veride kimin aldığı/sattığı yok; yön, fiyatın alış-satış ortasının üstünde olmasından tahmin edilir."""
+        q = self.cache[t]
+        last, vol = q.get("last"), q.get("volume")
+        if not last or vol is None or prev_vol is None or prev_last is None:
+            return None
+        delta = vol - prev_vol
+        if delta <= 0:
+            return None
+        now_ts = self.clock()
+        now_dt = now_tr()
+        mins = now_dt.hour * 60 + now_dt.minute
+        if not (START_MIN <= mins < END_MIN):
+            return None
+        if self.block_count >= MAX_BLOCKS_PER_SESSION:
+            return None
+        a = self.avg.get(t)
+        if not a or a["tl"] < MIN_AVG_TL_VOLUME or a["vol"] <= 0:
+            return None
+        delta_tl = delta * last
+        if delta_tl < BLOCK_MIN_TL or delta < BLOCK_MIN_PCT_AVG / 100 * a["vol"]:
+            return None
+        if delta > 1.5 * a["vol"]:
+            return None  # veri sıfırlanması/hata olabilir
+        if last < prev_last:
+            return None
+        bid, ask = q.get("bid"), q.get("ask")
+        if bid and ask and ask >= bid and last < (bid + ask) / 2:
+            return None
+        prev_block = self.last_block.get(t)
+        if prev_block is not None and now_ts - prev_block < BLOCK_COOLDOWN_MIN * 60:
+            return None
+        self.last_block[t] = now_ts
+        self.block_count += 1
+        day = q.get("change_percent")
+        day_txt = f"\nBugün toplam: %{day:+.1f}" if day is not None else ""
+        return (
+            f"🧱 {t}: büyük alım olabilir\n"
+            f"Şu anki fiyat: {last:.2f} TL{day_txt}\n"
+            f"Tek seferde gelen işlem: yaklaşık {delta:,.0f} adet ({delta_tl / 1e6:.1f} milyon TL)\n"
+            f"Bu, hissenin normal günlük hacminin %{delta / a['vol'] * 100:.0f}'i kadar\n"
+            f"Fiyat bu işlemde düşmedi, alıcı baskın görünüyor.\n"
+            f"Not: Kimin aldığı kesin bilinmez, bu bir tahmindir. Veri yaklaşık 15 dk gecikmeli "
+            f"olabilir, kendi uygulamandan kontrol et."
+        )
+
+    def _win(self, t, secs, now_ts, last, vol, a):
+        """Son 'secs' saniyedeki hareket ve hacim patlaması: (hareket %, hacim katı, süre, hareket TL)."""
+        hist = self.hist[t]
+        ref = None
+        for smp in reversed(hist):
+            if smp[0] <= now_ts - secs:
+                ref = smp
+                break
+        if ref is None:
+            ref = hist[0]
+        elapsed = now_ts - ref[0]
+        if elapsed < 0.8 * secs or not ref[1]:
+            return None
+        move_abs = last - ref[1]
+        move = move_abs / ref[1] * 100
+        vol_delta = vol - ref[2]
+        eff = min(elapsed, secs)
+        burst = vol_delta / (a["vol"] / 96 * (eff / 300)) if vol_delta > 0 else 0.0
+        return move, burst, eff, move_abs
+
+    # --- kalıplar: her biri uygunsa {"pattern","title","lines",...} döner ---
+    def _p_momentum(self, c):
+        w = c["w5"]
+        if not w:
+            return None
+        move, burst, eff, move_abs = w
+        if move < MIN_WINDOW_MOVE or move_abs < MIN_ABS_MOVE or burst < MIN_VOL_BURST:
+            return None
+        if c["last"] < NEAR_HIGH * c["high"]:
+            return None
+        if c["spread"] > SPREAD_MOVE_RATIO * move:
+            return None
+        return {"pattern": "ivme", "title": f"🚀 {c['t']} hızla yükseliyor",
+                "lines": [f"Son {eff / 60:.0f} dakikada: %{move:+.1f} yükseldi"]}
+
+    def _p_breakout(self, c):
+        t, now, last = c["t"], c["now"], c["last"]
+        hist = self.hist[t]
+        if hist[0][0] > now - BRK_MIN_WATCH_MIN * 60:
+            return None
+        segt = [s for s in hist if now - BRK_LOOKBACK_MIN * 60 <= s[0] <= now - 120]
+        if len(segt) < 8:
+            return None
+        seg = [s[1] for s in segt]
+        span_min = (segt[-1][0] - segt[0][0]) / 60
+        hi, lo = max(seg), min(seg)
+        if not lo:
+            return None
+        width = (hi / lo - 1) * 100
+        if width > BRK_MAX_RANGE or last < hi * (1 + BRK_MARGIN / 100):
+            return None
+        if last < NEAR_HIGH * c["high"]:
+            return None
+        w = c["w5"]
+        if not w or w[1] < BRK_MIN_BURST:
+            return None
+        return {"pattern": "kirilim", "title": f"📈 {t} dar aralığı yukarı kırdı",
+                "lines": [f"Yaklaşık {span_min:.0f} dakikadır {lo:.2f} - {hi:.2f} TL arasında bekliyordu "
+                          f"(aralık %{width:.1f})",
+                          f"Şimdi {last:.2f} TL ile bu aralığın üstüne çıktı"],
+                "stop": max(lo, last * (1 - STOP_PCT / 100))}
+
+    def _p_pullback(self, c):
+        t, now, last, high = c["t"], c["now"], c["last"], c["high"]
+        if c["day"] < PB_MIN_DAY or last > high * 0.995:
+            return None
+        hist = self.hist[t]
+        if hist[0][0] > now - 10 * 60:
+            return None
+        low = min(s[1] for s in hist if s[0] >= now - 20 * 60)
+        if not low:
+            return None
+        drop = (high / low - 1) * 100
+        bounce = (last / low - 1) * 100
+        if not (PB_MIN_DROP <= drop <= PB_MAX_DROP) or bounce < PB_MIN_BOUNCE:
+            return None
+        w = c["w5"]
+        if not w or w[1] < PB_MIN_BURST:
+            return None
+        stop = max(min(low * 0.997, last * 0.99), last * 0.95)
+        return {"pattern": "geri_donus", "title": f"↩️ {t} düşüşten dönüyor",
+                "lines": [f"Bugün %{c['day']:+.1f} yükselmişti, zirveden (%{drop:.1f}) geri çekildi",
+                          f"Dipten (%{bounce:.1f}) toparlandı, hacim artıyor"],
+                "stop": stop}
+
+    def _p_book(self, c):
+        t, now = c["t"], c["now"]
+        since = self.book_since.get(t)
+        if since is None or now - since < BOOK_HOLD_SEC:
+            return None
+        w = c["w5"]
+        if not w or w[0] < BOOK_MIN_MOVE or w[1] < BOOK_MIN_BURST:
+            return None
+        q = self.cache[t]
+        ratio = q["bid_size"] / q["ask_size"]
+        return {"pattern": "tahta", "title": f"⚖️ {t} alıcılar baskın",
+                "lines": [f"Alış tarafında bekleyen miktar, satış tarafının {ratio:.1f} katı "
+                          f"(en az {BOOK_HOLD_SEC} sn'dir)",
+                          f"Son 5 dakikada: %{w[0]:+.1f}"]}
 
     def _entry_check(self, t, quote):
         now_ts = self.clock()
@@ -158,11 +335,17 @@ class Engine:
         if not last or vol is None:
             return None
 
-        dq = self.ticks[t]
-        dq.append((now_ts, last, vol))
-        # pencere başındaki fiyatı taşımak için pencereden eski tek bir örnek tutulur
-        while len(dq) > 1 and dq[1][0] <= now_ts - WINDOW_SEC:
-            dq.popleft()
+        hist = self.hist[t]
+        hist.append((now_ts, last, vol))
+        while len(hist) > 1 and hist[1][0] <= now_ts - HIST_SEC:
+            hist.popleft()
+
+        bid, ask = q.get("bid") or 0, q.get("ask") or 0
+        bs, asz = q.get("bid_size"), q.get("ask_size")
+        if bid and ask and bs and asz and bs / asz >= BOOK_RATIO:
+            self.book_since.setdefault(t, now_ts)
+        else:
+            self.book_since.pop(t, None)
 
         now_dt = now_tr()
         mins = now_dt.hour * 60 + now_dt.minute
@@ -178,24 +361,11 @@ class Engine:
         a = self.avg.get(t)
         if not a or a["tl"] < MIN_AVG_TL_VOLUME or a["vol"] <= 0:
             return None
-
-        ref = dq[0]
-        elapsed = now_ts - ref[0]
-        if elapsed < 0.8 * WINDOW_SEC:
+        if not (bid and ask and ask >= bid):
             return None
-        move_abs = last - ref[1]
-        move = move_abs / ref[1] * 100
-        if move < MIN_WINDOW_MOVE or move_abs < MIN_ABS_MOVE:
+        spread = (ask - bid) / last * 100
+        if spread > MAX_SPREAD:
             return None
-
-        vol_delta = vol - ref[2]
-        if vol_delta <= 0:
-            return None
-        eff = min(elapsed, WINDOW_SEC)
-        burst = vol_delta / (a["vol"] / 96 * (eff / 300))
-        if burst < MIN_VOL_BURST:
-            return None
-
         day = q.get("change_percent")
         prev = q.get("prev_close")
         if day is None and prev:
@@ -203,39 +373,46 @@ class Engine:
         if day is None or not (MIN_DAY_CHANGE <= day <= MAX_DAY_CHANGE):
             return None
         high = q.get("high") or last
-        if last < NEAR_HIGH * high:
+
+        c = {"t": t, "now": now_ts, "last": last, "vol": vol, "day": day, "high": high,
+             "spread": spread, "w5": self._win(t, WINDOW_SEC, now_ts, last, vol, a)}
+        res = None
+        for fn in (self._p_momentum, self._p_breakout, self._p_pullback, self._p_book):
+            res = fn(c)
+            if res:
+                break
+        if not res:
             return None
 
-        bid, ask = q.get("bid") or 0, q.get("ask") or 0
-        if not (bid and ask and ask >= bid):
-            return None
-        spread = (ask - bid) / last * 100
-        if spread > MAX_SPREAD or spread > SPREAD_MOVE_RATIO * move:
-            return None
-
-        stop = last * (1 - STOP_PCT / 100)
+        w5 = c["w5"]
+        move = w5[0] if w5 else None
+        burst = w5[1] if w5 else None
+        stop = res.get("stop") or last * (1 - STOP_PCT / 100)
         target = last * (1 + TARGET_PCT / 100)
         self.last_alert[t] = now_ts
         self.alert_count += 1
         self.active.append({
             "date": str(now_dt.date()), "time": now_dt.strftime("%H:%M:%S"), "sym": t,
+            "pattern": res["pattern"],
             "price": last, "move": move, "day": day, "burst": burst, "spread": spread,
             "bid_size": q.get("bid_size"), "ask_size": q.get("ask_size"),
             "index": self.index_change, "stop": stop, "target": target, "ts": now_ts,
             "hi": last, "lo": last, "last": last, "p15": None, "p30": None, "p60": None,
             "outcome": None, "closed": False, "ev": set(),
         })
+        stop_pct = (1 - stop / last) * 100
+        burst_txt = f"İşlem hacmi: normalin {burst:.1f} katı\n" if burst is not None else ""
         return (
-            f"🚀 {t} hızla yükseliyor\n"
+            f"{res['title']}\n"
+            + "\n".join(res["lines"]) + "\n"
             f"Şu anki fiyat: {last:.2f} TL\n"
-            f"Son {eff / 60:.0f} dakikada: %{move:+.1f} yükseldi\n"
             f"Bugün toplam: %{day:+.1f}\n"
-            f"İşlem hacmi: normalin {burst:.1f} katı\n"
+            f"{burst_txt}"
             f"Alış fiyatı: {bid:.2f} | Satış fiyatı: {ask:.2f} (aradaki fark %{spread:.1f})\n"
             f"Günün en yüksek fiyatı: {high:.2f}\n"
             f"Alım için uygun aralık: {ask:.2f} - {ask * (1 + ENTRY_BAND_PCT / 100):.2f} TL "
             f"(bunun üstüne çıkarsa peşinden koşma)\n"
-            f"Örnek zarar durdur: {stop:.2f} TL (-%{STOP_PCT:g})\n"
+            f"Örnek zarar durdur: {stop:.2f} TL (-%{stop_pct:.1f})\n"
             f"Örnek hedef: {target:.2f} TL (+%{TARGET_PCT:g})\n"
             f"⏳ Veri yaklaşık 15 dk gecikmeli olabilir, fiyatı kendi uygulamandan kontrol et."
         )
@@ -247,6 +424,7 @@ class Engine:
                 p = r["price"]
                 rows.append({
                     "date": r["date"], "time": r["time"], "sym": r["sym"],
+                    "pattern": r["pattern"],
                     "price": f"{p:.4f}", "move": f2(r["move"]), "day": f2(r["day"]),
                     "burst": f2(r["burst"]), "spread": f2(r["spread"]),
                     "bid_size": "" if r["bid_size"] is None else r["bid_size"],
@@ -279,7 +457,7 @@ def summary_text(rows):
     for r in rows:
         sonuc = {"hedef": "hedefe ulaştı ✅", "stop": "zarar durdurdu ❌"}.get(r["outcome"], "henüz sonuçlanmadı")
         lines.append(
-            f"{r['sym']} (uyarı saati {r['time'][:5]}): şu an %{r['ret_end']}"
+            f"{r['sym']} [{PATTERN_NAMES.get(r['pattern'], r['pattern'])}] (uyarı saati {r['time'][:5]}): şu an %{r['ret_end']}"
             f" | en yüksek %{r['mfe']} | en düşük %{r['mae']} | {sonuc}"
         )
     return "Uyarılardan sonra ne oldu:\n" + "\n".join(lines)
@@ -326,6 +504,16 @@ def report_text(path=None):
         "60 dk sonraki getiri, alış-satış farkı düşülünce: " + show(mean(net)),
         "Uyarıdan sonra ortalama en derin düşüş: " + show(mean(vals("mae"))),
     ]
+    lines.append("")
+    lines.append("Kalıplara göre (hangisi işe yarıyor):")
+    for key, name in PATTERN_NAMES.items():
+        rs = [r for r in rows if (r.get("pattern") or "ivme") == key]
+        if not rs:
+            continue
+        h = sum(1 for r in rs if r["outcome"] == "hedef")
+        st = sum(1 for r in rs if r["outcome"] == "stop")
+        lines.append(f"{name}: {len(rs)} uyarı | hedef {h} | zarar durdur {st} | 60 dk sonra ort. "
+                     + show(mean(vals("ret60", rs))))
     if n < 30:
         lines.append("Not: 30'dan az uyarıyla sonuçlar rastlantı olabilir, para koymak için erken.")
     return "\n".join(lines)
@@ -372,7 +560,7 @@ def session_end(now):
 
 def safe_send(text):
     try:
-        send(text)
+        send(text if len(text) <= 4000 else text[:3990] + "\n…(kısaltıldı)")
     except Exception as e:
         print("Telegram hatası:", repr(e))
 
@@ -428,7 +616,7 @@ def run_live():
             write_log(rows)
         except Exception as e:
             print("Kayıt yazılamadı:", repr(e))
-    safe_send(f"🔴 Canlı takip bitti | {engine.alert_count} uyarı\n" + summary_text(rows))
+    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count}\n" + summary_text(rows))
 
 
 def run_report():
@@ -467,9 +655,10 @@ def run_test():
         derinliksiz = [t for t in quotes if quotes[t].get("bid") is None or quotes[t].get("ask") is None]
         lines.append(f"Veri gelen hisse: {len(quotes)} / {len(TICKERS)}")
         if yok:
-            lines.append("Hiç veri gelmeyenler: " + ", ".join(yok))
+            lines.append("Hiç veri gelmeyenler: " + ", ".join(yok[:25]) + (f" … (+{len(yok) - 25})" if len(yok) > 25 else ""))
         if derinliksiz:
-            lines.append("Alış/satış fiyatı boş gelenler (bu hisselerde sinyal verilmez): " + ", ".join(derinliksiz))
+            lines.append("Alış/satış fiyatı boş gelenler (bu hisselerde sinyal verilmez): " + ", ".join(derinliksiz[:25])
+                     + (f" … (+{len(derinliksiz) - 25})" if len(derinliksiz) > 25 else ""))
         try:
             iq = stream.wait_for_quote(INDEX_SYMBOL, timeout=5.0)
         except Exception:
