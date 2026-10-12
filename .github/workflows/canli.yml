@@ -1,0 +1,33 @@
+name: bist-canli
+on:
+  schedule:
+    - cron: "50 6 * * 1-5"   # 09:50 TRT, sabah oturumu (14:00'e kadar)
+    - cron: "55 10 * * 1-5"  # 13:55 TRT, öğleden sonra oturumu (18:05'e kadar)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "canli veya test"
+        default: "canli"
+concurrency:
+  group: bist-canli
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 280
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python canli.py "$MODE"
+        env:
+          MODE: ${{ inputs.mode || 'canli' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TV_SESSION: ${{ secrets.TV_SESSION }}
+          TV_SESSION_SIGN: ${{ secrets.TV_SESSION_SIGN }}
+          TV_USERNAME: ${{ secrets.TV_USERNAME }}
+          TV_PASSWORD: ${{ secrets.TV_PASSWORD }}
