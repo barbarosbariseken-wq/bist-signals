@@ -226,11 +226,18 @@ class Engine:
             "outcome": None, "closed": False, "ev": set(),
         })
         return (
-            f"🚀 {t} yükseliyor: {last:.2f} TL | {eff / 60:.0f} dk'da %{move:+.1f}"
-            f" | gün %{day:+.1f} | hacim {burst:.1f}x\n"
-            f"alış {bid:.2f} / satış {ask:.2f} (fark %{spread:.1f}) | günün zirvesi {high:.2f}\n"
-            f"uygun alım bölgesi {ask:.2f}-{ask * (1 + ENTRY_BAND_PCT / 100):.2f} (üstüne çıkarsa kovalama)\n"
-            f"örnek stop {stop:.2f} (-%{STOP_PCT:g}) | örnek hedef {target:.2f} (+%{TARGET_PCT:g})"
+            f"🚀 {t} hızla yükseliyor\n"
+            f"Şu anki fiyat: {last:.2f} TL\n"
+            f"Son {eff / 60:.0f} dakikada: %{move:+.1f} yükseldi\n"
+            f"Bugün toplam: %{day:+.1f}\n"
+            f"İşlem hacmi: normalin {burst:.1f} katı\n"
+            f"Alış fiyatı: {bid:.2f} | Satış fiyatı: {ask:.2f} (aradaki fark %{spread:.1f})\n"
+            f"Günün en yüksek fiyatı: {high:.2f}\n"
+            f"Alım için uygun aralık: {ask:.2f} - {ask * (1 + ENTRY_BAND_PCT / 100):.2f} TL "
+            f"(bunun üstüne çıkarsa peşinden koşma)\n"
+            f"Örnek zarar durdur: {stop:.2f} TL (-%{STOP_PCT:g})\n"
+            f"Örnek hedef: {target:.2f} TL (+%{TARGET_PCT:g})\n"
+            f"⏳ Veri yaklaşık 15 dk gecikmeli olabilir, fiyatı kendi uygulamandan kontrol et."
         )
 
     def finalize(self):
@@ -270,11 +277,12 @@ def summary_text(rows):
         return "Bu oturumda uyarı yok."
     lines = []
     for r in rows:
+        sonuc = {"hedef": "hedefe ulaştı ✅", "stop": "zarar durdurdu ❌"}.get(r["outcome"], "henüz sonuçlanmadı")
         lines.append(
-            f"{r['sym']} {r['time'][:5]}: şimdi %{r['ret_end']} | tepe %{r['mfe']}"
-            f" | dip %{r['mae']} | {r['outcome'] or 'açık'}"
+            f"{r['sym']} (uyarı saati {r['time'][:5]}): şu an %{r['ret_end']}"
+            f" | en yüksek %{r['mfe']} | en düşük %{r['mae']} | {sonuc}"
         )
-    return "Uyarıların sonradan ne yaptığı:\n" + "\n".join(lines)
+    return "Uyarılardan sonra ne oldu:\n" + "\n".join(lines)
 
 
 def report_text(path=None):
@@ -307,14 +315,16 @@ def report_text(path=None):
     acik = n - hedef - stop
     net = [float(r["ret60"]) - float(r["spread"]) for r in rows if r["ret60"] and r["spread"]]
     lines = [
-        f"📊 Uyarı karnesi ({n} uyarı)",
-        f"Önce hedef (+%{TARGET_PCT:g}): {hedef} (%{hedef / n * 100:.0f})",
-        f"Önce stop (-%{STOP_PCT:g}): {stop} (%{stop / n * 100:.0f})",
-        f"İkisi de olmadı: {acik}",
-        "Ortalama getiri: 15 dk " + show(mean(vals("ret15"))) + " | 30 dk " + show(mean(vals("ret30")))
-        + " | 60 dk " + show(mean(vals("ret60"))) + " | oturum sonu " + show(mean(vals("ret_end"))),
-        "60 dk, alış-satış farkı düşülmüş: " + show(mean(net)),
-        "Ortalama en kötü düşüş: " + show(mean(vals("mae"))),
+        f"📊 Uyarı karnesi (toplam {n} uyarı)",
+        f"Önce hedefe ulaşan (+%{TARGET_PCT:g}): {hedef} adet (%{hedef / n * 100:.0f})",
+        f"Önce zarar durduran (-%{STOP_PCT:g}): {stop} adet (%{stop / n * 100:.0f})",
+        f"İkisine de ulaşmayan: {acik} adet",
+        "Uyarıdan sonra ortalama getiri: 15 dk sonra " + show(mean(vals("ret15")))
+        + " | 30 dk sonra " + show(mean(vals("ret30")))
+        + " | 60 dk sonra " + show(mean(vals("ret60")))
+        + " | seans sonunda " + show(mean(vals("ret_end"))),
+        "60 dk sonraki getiri, alış-satış farkı düşülünce: " + show(mean(net)),
+        "Uyarıdan sonra ortalama en derin düşüş: " + show(mean(vals("mae"))),
     ]
     if n < 30:
         lines.append("Not: 30'dan az uyarıyla sonuçlar rastlantı olabilir, para koymak için erken.")
@@ -332,14 +342,14 @@ def apply_auth(bp):
                 bp.set_tradingview_auth(session=session, session_sign=sign)
             except TypeError:
                 bp.set_tradingview_auth(session=session, signature=sign)
-            return "çerez"
+            return "giriş yapıldı (çerez ile)"
         if user and pw:
             bp.set_tradingview_auth(username=user, password=pw)
-            return "kullanıcı adı/şifre"
+            return "giriş yapıldı (kullanıcı adı ile)"
     except Exception as e:
         print("TradingView girişi başarısız:", repr(e))
-        return "BAŞARISIZ"
-    return "yok (veri gecikmeli olabilir)"
+        return "giriş BAŞARISIZ"
+    return "giriş yok (veri yaklaşık 15 dk gecikmeli)"
 
 
 def open_stream(bp, engine):
@@ -379,8 +389,10 @@ def run_live():
     stream = open_stream(bp, engine)
     end = session_end(now_tr())
     safe_send(
-        f"🟢 Canlı takip başladı ({now_tr():%H:%M}) | {len(avg)}/{len(TICKERS)} hisse"
-        f" | TradingView girişi: {auth} | bitiş {end:%H:%M}"
+        f"🟢 Canlı takip başladı ({now_tr():%H:%M})\n"
+        f"Takip edilen hisse: {len(avg)} / {len(TICKERS)}\n"
+        f"TradingView hesabı: {auth}\n"
+        f"Bu oturum {end:%H:%M}'de bitecek"
     )
 
     reconnects = 0
@@ -426,45 +438,60 @@ def run_report():
 def run_test():
     import borsapy as bp
 
-    lines = [f"TradingView girişi: {apply_auth(bp)}"]
+    lines = [f"TradingView hesabı: {apply_auth(bp)}"]
     seen = {"n": 0}
     quotes = {}
     stream = bp.TradingViewStream()
     try:
         stream.connect()
         stream.on_any_quote(lambda s, q: seen.__setitem__("n", seen["n"] + 1))
-        sample = TICKERS[:3]
-        for t in sample:
-            stream.subscribe(t)
+        for t in TICKERS:
+            try:
+                stream.subscribe(t)
+            except Exception:
+                pass
         try:
             stream.subscribe(INDEX_SYMBOL)
         except Exception as e:
-            lines.append(f"{INDEX_SYMBOL} aboneliği hata: {e}")
-        for i, t in enumerate(sample):
-            q = stream.wait_for_quote(t, timeout=8.0)
-            if not q:
-                lines.append(f"{t}: quote gelmedi")
-                continue
-            quotes[t] = q
-            lines.append(
-                f"{t}: son {q.get('last')} | alış {q.get('bid')} | satış {q.get('ask')}"
-                f" | hacim {q.get('volume')} | zaman {q.get('timestamp')}"
-            )
+            lines.append(f"Endeks (BIST 100) takibi başlatılamadı: {e}")
+        time.sleep(20)
+        lines.append(f"Son 20 saniyede gelen fiyat güncellemesi: {seen['n']}")
+        for t in TICKERS:
+            try:
+                q = stream.wait_for_quote(t, timeout=0.5)
+            except Exception:
+                q = None
+            if q:
+                quotes[t] = q
+        yok = [t for t in TICKERS if t not in quotes]
+        derinliksiz = [t for t in quotes if quotes[t].get("bid") is None or quotes[t].get("ask") is None]
+        lines.append(f"Veri gelen hisse: {len(quotes)} / {len(TICKERS)}")
+        if yok:
+            lines.append("Hiç veri gelmeyenler: " + ", ".join(yok))
+        if derinliksiz:
+            lines.append("Alış/satış fiyatı boş gelenler (bu hisselerde sinyal verilmez): " + ", ".join(derinliksiz))
         try:
-            iq = stream.wait_for_quote(INDEX_SYMBOL, timeout=8.0)
+            iq = stream.wait_for_quote(INDEX_SYMBOL, timeout=5.0)
         except Exception:
             iq = None
         if iq:
-            lines.append(f"{INDEX_SYMBOL}: son {iq.get('last')} | değişim %{iq.get('change_percent')}")
+            lines.append(f"BIST 100 endeksi: {iq.get('last')} (bugün %{iq.get('change_percent')})")
         else:
-            lines.append(f"{INDEX_SYMBOL}: quote gelmedi (endeks filtresi devre dışı kalır)")
-        n0 = seen["n"]
-        time.sleep(20)
-        lines.append(f"20 sn'de gelen güncelleme sayısı: {seen['n'] - n0}")
-        for t, a in get_avg_stats(list(quotes)).items():
+            lines.append("BIST 100 endeksi: veri gelmedi (piyasa düşüş filtresi çalışmaz)")
+        lines.append("")
+        lines.append("Örnek hisseler:")
+        for t in list(quotes)[:3]:
+            q = quotes[t]
             lines.append(
-                f"{t} birim kontrolü: geçmiş ort. günlük hacim {a['vol']:,.0f}"
-                f" | bugünkü canlı hacim {quotes[t].get('volume')}"
+                f"{t}: fiyat {q.get('last')} | alış {q.get('bid')} | satış {q.get('ask')}"
+                f" | bugünkü hacim {q.get('volume')}"
+            )
+        lines.append("")
+        lines.append("Hacim kontrolü (iki sayı aynı büyüklükte olmalı):")
+        for t, a in get_avg_stats(list(quotes)[:3]).items():
+            lines.append(
+                f"{t}: son 20 günün ortalama günlük hacmi {a['vol']:,.0f}"
+                f" | bugünkü hacim {quotes[t].get('volume')}"
             )
     except Exception as e:
         lines.append(f"HATA: {type(e).__name__}: {e}")
@@ -473,7 +500,7 @@ def run_test():
             stream.disconnect()
         except Exception:
             pass
-    safe_send("🔧 Canlı test sonucu\n" + "\n".join(lines))
+    safe_send("🔧 Bağlantı testi sonucu\n" + "\n".join(lines))
 
 
 def main():
