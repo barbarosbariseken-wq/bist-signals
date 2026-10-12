@@ -11,7 +11,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: bist-canli
+  group: bist-canli-${{ inputs.mode || 'canli' }}
   cancel-in-progress: false
 jobs:
   run:
