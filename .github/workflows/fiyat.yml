@@ -8,6 +8,10 @@ on:
       tolerance:
         description: "Tolerans yüzde, örn: 5"
         default: "5"
+      min_day:
+        description: "İsteğe bağlı: bugün en az yüzde kaç yükselmiş olsun, örn: 9 (tavan için)"
+        required: false
+        default: ""
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -19,9 +23,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python fiyat.py "$PRICE" "$TOL"
+      - run: python fiyat.py "$PRICE" "$TOL" "$MIN_DAY"
         env:
           PRICE: ${{ inputs.price }}
           TOL: ${{ inputs.tolerance }}
+          MIN_DAY: ${{ inputs.min_day }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
