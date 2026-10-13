@@ -1,0 +1,27 @@
+name: bist-fiyat
+on:
+  workflow_dispatch:
+    inputs:
+      price:
+        description: "Fiyat (TL), örn: 8,50"
+        required: true
+      tolerance:
+        description: "Tolerans yüzde, örn: 5"
+        default: "5"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python fiyat.py "$PRICE" "$TOL"
+        env:
+          PRICE: ${{ inputs.price }}
+          TOL: ${{ inputs.tolerance }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
