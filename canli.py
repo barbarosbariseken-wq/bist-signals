@@ -54,6 +54,16 @@ BOOK_MIN_MOVE = 0.5        # tahta: son 5 dk'da en az %0,5 yükselmiş
 BOOK_MIN_BURST = 1.5
 PATTERN_NAMES = {"ivme": "Hızlı yükseliş", "kirilim": "Dar aralık kırılımı",
                  "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı"}
+# --- tavan takibi ---
+LIMIT_PCT = 10.0            # günlük fiyat sınırı (%)
+LIMIT_MIN_DAY = 9.5         # en az bu kadar yükselmişse tavan sayılabilir
+LIMIT_LEAVE_SEC = 120       # tavandan bu kadar süre uzak kalırsa tavan bozuldu sayılır
+LIMIT_START_MIN = 10 * 60   # tavan bildirimleri 10:00-17:50 arası
+LIMIT_END_MIN = 17 * 60 + 50
+LIMIT_MIN_QUEUE_TL = 200_000  # en yüksek kuyruk bunun altındaysa azalma bildirimi yapılmaz (gürültü)
+LIMIT_DROP_1 = 0.50         # kuyruk bu orana (en yüksek kuyruğun %50'sine) inince ilk bildirim
+LIMIT_DROP_2 = 0.25         # %75 azalınca ikinci bildirim
+MAX_LIMIT_MSGS = 40
 BLOCK_MIN_TL = 1_000_000   # tek güncellemede en az bu kadar TL'lik işlem = "blok" sayılır
 BLOCK_MIN_PCT_AVG = 8.0    # ve normal günlük hacmin en az bu kadar %'si
 BLOCK_COOLDOWN_MIN = 30    # aynı hisse için iki blok bildirimi arası (dk)
@@ -89,6 +99,8 @@ class Engine:
         self.alert_count = 0
         self.block_count = 0
         self.last_block = {}
+        self.limit = {}
+        self.limit_count = 0
         self.index_change = None
         self.active = []  # uyarı sonrası takip edilen kayıtlar
         self.lock = threading.Lock()
@@ -177,6 +189,82 @@ class Engine:
         block = self._block_check(t, prev_vol, prev_last)
         if block:
             msgs.append(block)
+        msgs.extend(self._limit_check(t))
+        return msgs
+
+    @staticmethod
+    def _tick(p):
+        for top, step in ((20, 0.01), (50, 0.02), (100, 0.05), (250, 0.10), (500, 0.25),
+                          (1000, 0.50), (2500, 1.0)):
+            if p < top:
+                return step
+        return 2.5
+
+    def _limit_check(self, t):
+        """Tavana kilitlenen hisseyi bildirir; alış kuyruğu en yüksek değerinin %50'sine ve %25'ine inince uyarır.
+        Kuyruk = tavan fiyatındaki bekleyen alış miktarı (bid_size). Veri gecikmeliyse uyarı da gecikir."""
+        q = self.cache[t]
+        last, prev = q.get("last"), q.get("prev_close")
+        if not last or not prev:
+            return []
+        now_ts = self.clock()
+        now_dt = now_tr()
+        mins = now_dt.hour * 60 + now_dt.minute
+        if not (LIMIT_START_MIN <= mins < LIMIT_END_MIN):
+            return []
+        tick = self._tick(prev * (1 + LIMIT_PCT / 100))
+        ceiling = int(prev * (1 + LIMIT_PCT / 100) / tick + 1e-6) * tick
+        day = (last / prev - 1) * 100
+        at_limit = last >= ceiling - tick * 0.5 and day >= LIMIT_MIN_DAY
+        st = self.limit.get(t)
+        bs = q.get("bid_size")
+
+        if not at_limit:
+            if st is not None:
+                if st["off_since"] is None:
+                    st["off_since"] = now_ts
+                elif now_ts - st["off_since"] >= LIMIT_LEAVE_SEC:
+                    del self.limit[t]  # tavan bozuldu; tekrar kilitlenirse yeni bildirim gelir
+            return []
+
+        msgs = []
+        if st is None:
+            if self.limit_count >= MAX_LIMIT_MSGS:
+                return []
+            st = self.limit[t] = {"peak": 0.0, "since": now_ts, "off_since": None, "s50": False, "s75": False}
+            self.limit_count += 1
+            if bs:
+                st["peak"] = float(bs)
+                qtxt = (f"Tavanda bekleyen alış: {bs:,.0f} adet (yaklaşık {bs * last / 1e6:.1f} milyon TL)\n"
+                        f"Bu kuyruk %50 ve %75 eridiğinde ayrıca haber vereceğim.")
+            else:
+                qtxt = "Tavanda bekleyen alış miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
+            msgs.append(
+                f"🔒 {t} tavan oldu\n"
+                f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}"
+            )
+            return msgs
+        st["off_since"] = None
+        if not bs:
+            return []
+        bs = float(bs)
+        if bs > st["peak"]:
+            st["peak"] = bs
+            return []
+        peak = st["peak"]
+        if peak * last < LIMIT_MIN_QUEUE_TL:
+            return []
+        ratio = bs / peak
+        gone = (1 - ratio) * 100
+        head = (f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n"
+                f"Takip ettiğim en yüksek kuyruk: {peak:,.0f} adet → şimdi {bs:,.0f} adet (%{gone:.0f} azaldı)\n"
+                f"Alıcılar çekilmiş ya da satışlar karşılanmış olabilir.")
+        if ratio <= LIMIT_DROP_2 and not st["s75"]:
+            st["s75"] = st["s50"] = True
+            msgs.append(f"🚨 {t}: tavandaki alış kuyruğu %75 azaldı, tavan bozulabilir\n" + head)
+        elif ratio <= LIMIT_DROP_1 and not st["s50"]:
+            st["s50"] = True
+            msgs.append(f"⚠️ {t}: tavandaki alış kuyruğu %50 azaldı\n" + head)
         return msgs
 
     def _block_check(self, t, prev_vol, prev_last):
@@ -616,7 +704,7 @@ def run_live():
             write_log(rows)
         except Exception as e:
             print("Kayıt yazılamadı:", repr(e))
-    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count}\n" + summary_text(rows))
+    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count} | Tavan olan hisse: {engine.limit_count}\n" + summary_text(rows))
 
 
 def run_report():
