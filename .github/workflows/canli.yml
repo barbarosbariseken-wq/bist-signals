@@ -29,6 +29,7 @@ jobs:
           MODE: ${{ inputs.mode || 'canli' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PORTFOY: ${{ secrets.PORTFOY }}
           TV_SESSION: ${{ secrets.TV_SESSION }}
           TV_SESSION_SIGN: ${{ secrets.TV_SESSION_SIGN }}
           TV_USERNAME: ${{ secrets.TV_USERNAME }}
