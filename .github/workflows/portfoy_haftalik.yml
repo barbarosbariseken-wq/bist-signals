@@ -1,0 +1,26 @@
+name: bist-portfoy-haftalik
+on:
+  schedule:
+    - cron: "40 15 * * 5"   # Cuma 18:40 TRT (kapanıştan sonra)
+  workflow_dispatch:
+concurrency:
+  group: bist-portfoy-haftalik
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install yfinance pandas requests cryptography
+      - run: python portfoy_haftalik.py
+        env:
+          PORTFOY: ${{ secrets.PORTFOY }}
+          PORTFOY_HAFTA_BASI: ${{ secrets.PORTFOY_HAFTA_BASI }}
+          SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
