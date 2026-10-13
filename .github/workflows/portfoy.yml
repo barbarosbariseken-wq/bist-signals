@@ -1,0 +1,25 @@
+name: bist-portfoy
+on:
+  schedule:
+    - cron: "*/15 7-14 * * 1-5"   # 10:00-17:45 TRT, her 15 dk
+    - cron: "0 15 * * 1-5"        # 18:00 TRT
+  workflow_dispatch:
+concurrency:
+  group: bist-portfoy
+  cancel-in-progress: true
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install yfinance pandas requests
+      - run: python portfoy.py
+        env:
+          PORTFOY: ${{ secrets.PORTFOY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
