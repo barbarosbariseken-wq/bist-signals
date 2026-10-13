@@ -1,6 +1,7 @@
 """Canlı takip: TradingView akışına (borsapy) bağlanır, hızlı yükselen hisseleri anında bildirir
 ve her uyarının sonrasını kaydeder (ileri test), böylece stratejinin işe yarayıp yaramadığı ölçülür."""
 import csv
+import math
 import os
 import queue
 import sys
@@ -87,12 +88,14 @@ def f2(x):
 
 
 class Engine:
-    def __init__(self, avg, out, clock=None):
+    def __init__(self, avg, out, clock=None, portfolio=()):
+        self.portfolio = set(portfolio)
+        names = list(TICKERS) + [p for p in self.portfolio if p not in TICKERS]
         self.avg = avg
         self.out = out
         self.clock = clock or (lambda: CLOCK())
-        self.cache = {t: {} for t in TICKERS}
-        self.hist = {t: deque() for t in TICKERS}
+        self.cache = {t: {} for t in names}
+        self.hist = {t: deque() for t in names}
         self.book_since = {}
         self.last_alert = {}
         self.last_tick = self.clock()
@@ -192,81 +195,6 @@ class Engine:
         msgs.extend(self._limit_check(t))
         return msgs
 
-    @staticmethod
-    def _tick(p):
-        for top, step in ((20, 0.01), (50, 0.02), (100, 0.05), (250, 0.10), (500, 0.25),
-                          (1000, 0.50), (2500, 1.0)):
-            if p < top:
-                return step
-        return 2.5
-
-    def _limit_check(self, t):
-        """Tavana kilitlenen hisseyi bildirir; alış kuyruğu en yüksek değerinin %50'sine ve %25'ine inince uyarır.
-        Kuyruk = tavan fiyatındaki bekleyen alış miktarı (bid_size). Veri gecikmeliyse uyarı da gecikir."""
-        q = self.cache[t]
-        last, prev = q.get("last"), q.get("prev_close")
-        if not last or not prev:
-            return []
-        now_ts = self.clock()
-        now_dt = now_tr()
-        mins = now_dt.hour * 60 + now_dt.minute
-        if not (LIMIT_START_MIN <= mins < LIMIT_END_MIN):
-            return []
-        tick = self._tick(prev * (1 + LIMIT_PCT / 100))
-        ceiling = int(prev * (1 + LIMIT_PCT / 100) / tick + 1e-6) * tick
-        day = (last / prev - 1) * 100
-        at_limit = last >= ceiling - tick * 0.5 and day >= LIMIT_MIN_DAY
-        st = self.limit.get(t)
-        bs = q.get("bid_size")
-
-        if not at_limit:
-            if st is not None:
-                if st["off_since"] is None:
-                    st["off_since"] = now_ts
-                elif now_ts - st["off_since"] >= LIMIT_LEAVE_SEC:
-                    del self.limit[t]  # tavan bozuldu; tekrar kilitlenirse yeni bildirim gelir
-            return []
-
-        msgs = []
-        if st is None:
-            if self.limit_count >= MAX_LIMIT_MSGS:
-                return []
-            st = self.limit[t] = {"peak": 0.0, "since": now_ts, "off_since": None, "s50": False, "s75": False}
-            self.limit_count += 1
-            if bs:
-                st["peak"] = float(bs)
-                qtxt = (f"Tavanda bekleyen alış: {bs:,.0f} adet (yaklaşık {bs * last / 1e6:.1f} milyon TL)\n"
-                        f"Bu kuyruk %50 ve %75 eridiğinde ayrıca haber vereceğim.")
-            else:
-                qtxt = "Tavanda bekleyen alış miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
-            msgs.append(
-                f"🔒 {t} tavan oldu\n"
-                f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}"
-            )
-            return msgs
-        st["off_since"] = None
-        if not bs:
-            return []
-        bs = float(bs)
-        if bs > st["peak"]:
-            st["peak"] = bs
-            return []
-        peak = st["peak"]
-        if peak * last < LIMIT_MIN_QUEUE_TL:
-            return []
-        ratio = bs / peak
-        gone = (1 - ratio) * 100
-        head = (f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n"
-                f"Takip ettiğim en yüksek kuyruk: {peak:,.0f} adet → şimdi {bs:,.0f} adet (%{gone:.0f} azaldı)\n"
-                f"Alıcılar çekilmiş ya da satışlar karşılanmış olabilir.")
-        if ratio <= LIMIT_DROP_2 and not st["s75"]:
-            st["s75"] = st["s50"] = True
-            msgs.append(f"🚨 {t}: tavandaki alış kuyruğu %75 azaldı, tavan bozulabilir\n" + head)
-        elif ratio <= LIMIT_DROP_1 and not st["s50"]:
-            st["s50"] = True
-            msgs.append(f"⚠️ {t}: tavandaki alış kuyruğu %50 azaldı\n" + head)
-        return msgs
-
     def _block_check(self, t, prev_vol, prev_last):
         """Tek güncellemede çok büyük hacim gelip fiyat düşmediyse 'blok alım olabilir' der.
         Veride kimin aldığı/sattığı yok; yön, fiyatın alış-satış ortasının üstünde olmasından tahmin edilir."""
@@ -313,6 +241,100 @@ class Engine:
             f"Not: Kimin aldığı kesin bilinmez, bu bir tahmindir. Veri yaklaşık 15 dk gecikmeli "
             f"olabilir, kendi uygulamandan kontrol et."
         )
+
+    @staticmethod
+    def _tick(p):
+        for top, step in ((20, 0.01), (50, 0.02), (100, 0.05), (250, 0.10), (500, 0.25),
+                          (1000, 0.50), (2500, 1.0)):
+            if p < top:
+                return step
+        return 2.5
+
+    def _limit_check(self, t):
+        """Tavan (tüm liste) ve taban (sadece portföy) takibi. Kuyruk: tavanda bekleyen alış (bid_size),
+        tabanda bekleyen satış (ask_size). Kuyruk, görülen en yüksek değerinin %50'sine ve %25'ine inince uyarır.
+        Veri gecikmeliyse uyarı da gecikir."""
+        q = self.cache[t]
+        last, prev = q.get("last"), q.get("prev_close")
+        if not last or not prev:
+            return []
+        now_dt = now_tr()
+        mins = now_dt.hour * 60 + now_dt.minute
+        if not (LIMIT_START_MIN <= mins < LIMIT_END_MIN):
+            return []
+        mine = t in self.portfolio
+        day = (last / prev - 1) * 100
+        msgs = []
+        sides = [("tavan", 1)] + ([("taban", -1)] if mine else [])
+        for side, sgn in sides:
+            tick = self._tick(prev * (1 + sgn * LIMIT_PCT / 100))
+            if sgn > 0:
+                level = int(prev * (1 + LIMIT_PCT / 100) / tick + 1e-6) * tick
+                at = last >= level - tick * 0.5 and day >= LIMIT_MIN_DAY
+                qty = q.get("bid_size")
+            else:
+                level = math.ceil(prev * (1 - LIMIT_PCT / 100) / tick - 1e-6) * tick  # yukarı yuvarla
+                at = last <= level + tick * 0.5 and day <= -LIMIT_MIN_DAY
+                qty = q.get("ask_size")
+            msgs.extend(self._limit_side(t, side, at, qty, last, day, mine))
+        return msgs
+
+    def _limit_side(self, t, side, at, qty, last, day, mine):
+        now_ts = self.clock()
+        key = (t, side)
+        st = self.limit.get(key)
+        who = " (portföyünde)" if mine else ""
+        if not at:
+            if st is not None:
+                if st["off_since"] is None:
+                    st["off_since"] = now_ts
+                elif now_ts - st["off_since"] >= LIMIT_LEAVE_SEC:
+                    del self.limit[key]  # bozuldu; tekrar kilitlenirse yeni bildirim gelir
+            return []
+        what = "alış" if side == "tavan" else "satış"
+        if st is None:
+            if not mine and self.limit_count >= MAX_LIMIT_MSGS:
+                return []
+            st = self.limit[key] = {"peak": 0.0, "since": now_ts, "off_since": None, "s50": False, "s75": False}
+            if not mine:
+                self.limit_count += 1
+            icon = "🔒" if side == "tavan" else "🧊"
+            if qty:
+                st["peak"] = float(qty)
+                qtxt = (f"{side.capitalize()}da bekleyen {what}: {qty:,.0f} adet (yaklaşık {qty * last / 1e6:.1f} milyon TL)\n"
+                        f"Bu kuyruk %50 ve %75 eridiğinde ayrıca haber vereceğim.")
+            else:
+                qtxt = f"{side.capitalize()}da bekleyen {what} miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
+            return [f"{icon} {t}{who} {side} oldu\nFiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}"]
+        st["off_since"] = None
+        if not qty:
+            return []
+        qty = float(qty)
+        if qty > st["peak"]:
+            st["peak"] = qty
+            return []
+        peak = st["peak"]
+        if peak * last < LIMIT_MIN_QUEUE_TL:
+            return []
+        ratio = qty / peak
+        if side == "tavan":
+            note = "Alıcılar çekilmiş ya da satışlar karşılanmış olabilir."
+            t50 = f"⚠️ {t}{who}: tavandaki alış kuyruğu %50 azaldı"
+            t75 = f"🚨 {t}{who}: tavandaki alış kuyruğu %75 azaldı, tavan bozulabilir"
+        else:
+            note = "Satıcılar çekilmiş ya da alımlar karşılamış olabilir."
+            t50 = f"⚠️ {t}{who}: tabandaki satış kuyruğu %50 azaldı"
+            t75 = f"🚨 {t}{who}: tabandaki satış kuyruğu %75 azaldı, taban bozulabilir"
+        head = (f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n"
+                f"Takip ettiğim en yüksek kuyruk: {peak:,.0f} adet → şimdi {qty:,.0f} adet "
+                f"(%{(1 - ratio) * 100:.0f} azaldı)\n{note}")
+        if ratio <= LIMIT_DROP_2 and not st["s75"]:
+            st["s75"] = st["s50"] = True
+            return [t75 + "\n" + head]
+        if ratio <= LIMIT_DROP_1 and not st["s50"]:
+            st["s50"] = True
+            return [t50 + "\n" + head]
+        return []
 
     def _win(self, t, secs, now_ts, last, vol, a):
         """Son 'secs' saniyedeki hareket ve hacim patlaması: (hareket %, hacim katı, süre, hareket TL)."""
@@ -628,12 +650,25 @@ def apply_auth(bp):
     return "giriş yok (veri yaklaşık 15 dk gecikmeli)"
 
 
+def portfolio_symbols():
+    """PORTFOY secret'ından sembolleri okur (yoksa boş)."""
+    try:
+        from portfoy import parse_portfolio
+        return [h["sym"] for h in parse_portfolio(os.environ.get("PORTFOY", ""))]
+    except Exception as e:
+        print("portföy okunamadı:", repr(e))
+        return []
+
+
 def open_stream(bp, engine):
     stream = bp.TradingViewStream()
     stream.connect()
     stream.on_any_quote(engine.on_quote)
-    for t in TICKERS:
-        stream.subscribe(t)
+    for t in list(TICKERS) + [p for p in engine.portfolio if p not in TICKERS]:
+        try:
+            stream.subscribe(t)
+        except Exception as e:
+            print("abonelik başarısız:", t, repr(e))
     try:
         stream.subscribe(INDEX_SYMBOL)
     except Exception as e:
@@ -661,12 +696,14 @@ def run_live():
     if not avg:
         raise RuntimeError("Ortalama hacim verisi alınamadı")
     out = queue.Queue()
-    engine = Engine(avg, out)
+    pf = portfolio_symbols()
+    engine = Engine(avg, out, portfolio=pf)
     stream = open_stream(bp, engine)
     end = session_end(now_tr())
     safe_send(
         f"🟢 Canlı takip başladı ({now_tr():%H:%M})\n"
-        f"Takip edilen hisse: {len(avg)} / {len(TICKERS)}\n"
+        f"Takip edilen hisse: {len(avg)} / {len(TICKERS)}"
+        + (f" + portföy: {', '.join(pf)}" if pf else "") + "\n"
         f"TradingView hesabı: {auth}\n"
         f"Bu oturum {end:%H:%M}'de bitecek"
     )
