@@ -165,7 +165,14 @@ def run():
                 have_qty = True
                 part += f" ({pnl:+,.0f} TL)"
         marks = "".join(sorted({ICON[k] for k in cur_all}))
-        lines.append(part + (f" {marks}" if marks else ""))
+        stop_v = h["stop"] if h["stop"] else (h["cost"] * (1 - STOP_PCT / 100) if h["cost"] else None)
+        tgt_v = h["target"] if h["target"] else (h["cost"] * (1 + TARGET_PCT / 100) if h["cost"] else None)
+        lv = []
+        if stop_v:
+            lv.append(f"stop {stop_v:.2f}")
+        if tgt_v:
+            lv.append(f"hedef {tgt_v:.2f}")
+        lines.append(part + (f" {marks}" if marks else "") + (f"\n   ({' | '.join(lv)})" if lv else ""))
         fresh = [k for k in cur_all if k not in prev_all]
         groups = {}
         for k in fresh:
