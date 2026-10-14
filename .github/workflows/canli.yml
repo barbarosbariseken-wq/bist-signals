@@ -41,6 +41,8 @@ jobs:
             git config user.name "bist-bot"
             git config user.email "bist-bot@users.noreply.github.com"
             git add alerts.csv
+            [ -f kontrol.csv ] && git add kontrol.csv
+            [ -f izler.csv ] && git add izler.csv
             if ! git diff --staged --quiet; then
               git commit -m "alerts"
               git pull --rebase
