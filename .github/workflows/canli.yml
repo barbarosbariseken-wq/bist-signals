@@ -6,8 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "canli, test veya rapor"
+        description: "canli, test, rapor veya tani"
         default: "canli"
+      sembol:
+        description: "tani modunda dinlenecek hisse(ler), örn HUBVC"
+        default: "HUBVC"
 permissions:
   contents: write
 concurrency:
@@ -27,6 +30,7 @@ jobs:
       - run: python canli.py "$MODE"
         env:
           MODE: ${{ inputs.mode || 'canli' }}
+          TANI_SEMBOL: ${{ inputs.sembol || 'HUBVC' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PORTFOY: ${{ secrets.PORTFOY }}
