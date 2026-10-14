@@ -1,0 +1,23 @@
+name: bist-simule
+on:
+  schedule:
+    - cron: "45 15 * * 5"   # Cuma 18:45 TRT, haftanın verisiyle
+  workflow_dispatch:
+concurrency:
+  group: bist-simule
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install yfinance pandas requests
+      - run: python simule.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
