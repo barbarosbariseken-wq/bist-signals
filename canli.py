@@ -4,6 +4,7 @@ import csv
 import math
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -70,7 +71,10 @@ MAX_SHADOW_PER_SESSION = 30    # filtrelenen (gönderilmeyen) ama izlenen uyarı
 # --- tavan takibi ---
 LIMIT_PCT = 10.0            # günlük fiyat sınırı (%)
 LIMIT_MIN_DAY = 9.5         # en az bu kadar yükselmişse tavan sayılabilir
-LIMIT_LEAVE_SEC = 120       # tavandan bu kadar süre uzak kalırsa tavan bozuldu sayılır
+LIMIT_LEAVE_SEC = 120       # tavandan bu kadar süre uzak kalırsa kayıt silinir (tekrar kilitlenirse yeni kayıt)
+LIMIT_CONFIRM_SEC = 20      # tavanda/tabanda bu kadar süre durmadan "oldu" denmez (anlık dokunuş tavan sayılmaz)
+LIMIT_BREAK_CONFIRM_SEC = 10  # seviyeden bu kadar süre uzak kalınca "bozuldu" / "tutunamadı" denir
+MAX_TOUCH_MSGS = 15         # "değdi ama tutunamadı" bildirimleri için oturum üst sınırı
 LIMIT_START_MIN = 10 * 60   # tavan bildirimleri 10:00-17:50 arası
 LIMIT_END_MIN = 17 * 60 + 50
 LIMIT_MIN_QUEUE_TL = 200_000  # en yüksek kuyruk bunun altındaysa azalma bildirimi yapılmaz (gürültü)
@@ -81,6 +85,13 @@ BLOCK_MIN_TL = 1_000_000   # tek güncellemede en az bu kadar TL'lik işlem = "b
 BLOCK_MIN_PCT_AVG = 8.0    # ve normal günlük hacmin en az bu kadar %'si
 BLOCK_COOLDOWN_MIN = 30    # aynı hisse için iki blok bildirimi arası (dk)
 MAX_BLOCKS_PER_SESSION = 10
+# --- kontrol grubu: uyarı verilmeyen ama aynı ön şartları taşıyan rastgele hisseler (uyarılar şanstan iyi mi?) ---
+CONTROL_FILE = "kontrol.csv"
+CONTROL_MEAN_MIN = 20       # ortalama kaç dakikada bir rastgele örnek seçilir
+CONTROL_MAX = 15            # oturum başına en fazla örnek
+TRACE_FILE = "izler.csv"    # uyarı ve kontrol örneklerinin dakikalık fiyat izi (farklı stop/hedef denemek için)
+TRACE_MIN = 120             # iz en fazla bu kadar dakika tutulur
+TRACE_FIELDS = ["date", "time", "sym", "kind", "pattern", "price", "spread", "trace"]
 LOG_FILE = "alerts.csv"
 LOG_FIELDS = ["date", "time", "sym", "pattern", "price", "move", "day", "burst", "spread", "bid_size",
               "ask_size", "index", "stop", "target", "ret15", "ret30", "ret60", "ret_end",
@@ -118,6 +129,10 @@ class Engine:
         self.last_block = {}
         self.limit = {}
         self.limit_count = 0
+        self.touch_count = 0
+        self.rng = random.Random()
+        self.next_ctrl = None
+        self.ctrl = []     # kontrol grubu kayıtları (mesaj yok, sadece izlenir)
         self.index_change = None
         self.active = []  # uyarı sonrası takip edilen kayıtlar
         self.lock = threading.Lock()
@@ -143,6 +158,32 @@ class Engine:
             self.out.put(m)
 
     # --- uyarı sonrası takip: ileri test ve çıkış (sat) uyarıları ---
+    def _track(self, r, last, now_ts):
+        """Bir kaydın (uyarı ya da kontrol örneği) fiyat takibi: en yüksek/düşük, 15/30/60 dk, sonuç, dakikalık iz."""
+        r["last"] = last
+        r["hi"] = max(r["hi"], last)
+        r["lo"] = min(r["lo"], last)
+        el = now_ts - r["ts"]
+        for m in (15, 30, 60):
+            if r[f"p{m}"] is None and el >= m * 60:
+                r[f"p{m}"] = last
+        if r["outcome"] is None:
+            if last <= r["stop"]:
+                r["outcome"] = "stop"
+            elif last >= r["target"]:
+                r["outcome"] = "hedef"
+        mi = int(el // 60)
+        tr = r["trace"]
+        while r["tmin"] < mi and r["tmin"] < TRACE_MIN:
+            tr.append((r["mlo"], r["mhi"], r["mcl"]))
+            r["mlo"] = r["mhi"] = r["mcl"]
+            r["tmin"] += 1
+        if r["tmin"] < TRACE_MIN:
+            r["mlo"] = min(r["mlo"], last)
+            r["mhi"] = max(r["mhi"], last)
+            r["mcl"] = last
+        return el
+
     def _exits(self, t):
         q = self.cache[t]
         last = q.get("last")
@@ -153,20 +194,12 @@ class Engine:
         for r in self.active:
             if r["sym"] != t:
                 continue
-            r["last"] = last
-            r["hi"] = max(r["hi"], last)
-            r["lo"] = min(r["lo"], last)
-            el = now_ts - r["ts"]
-            for m in (15, 30, 60):
-                if r[f"p{m}"] is None and el >= m * 60:
-                    r[f"p{m}"] = last
-            if r["outcome"] is None:
-                if last <= r["stop"]:
-                    r["outcome"] = "stop"
-                elif last >= r["target"]:
-                    r["outcome"] = "hedef"
+            el = self._track(r, last, now_ts)
             if not r.get("shadow"):
                 msgs.extend(self._exit_msgs(r, last, el))
+        for r in self.ctrl:
+            if r["sym"] == t:
+                self._track(r, last, now_ts)
         return msgs
 
     def _exit_msgs(self, r, last, el):
@@ -291,46 +324,69 @@ class Engine:
                 level = math.ceil(prev * (1 - LIMIT_PCT / 100) / tick - 1e-6) * tick  # yukarı yuvarla
                 at = last <= level + tick * 0.5 and day <= -LIMIT_MIN_DAY
                 qty = q.get("ask_size")
-            msgs.extend(self._limit_side(t, side, at, qty, last, day, mine))
+            msgs.extend(self._limit_side(t, side, at, qty, last, day, mine, level))
         return msgs
 
-    def _limit_side(self, t, side, at, qty, last, day, mine):
+    def _limit_side(self, t, side, at, qty, last, day, mine, level):
+        """Tavan/taban takibi. Fiyat seviyeye değdiği andan itibaren kuyruk sessizce kaydedilir (en yüksek değer
+        'peak'). Kuyruk büyürken hiçbir şey söylenmez. Bildirimler:
+        - 'oldu': seviyede LIMIT_CONFIRM_SEC saniye durduktan sonra (anlık dokunuşlar tavan sayılmaz)
+        - kuyruk zirveden %50 ve %75 azalınca
+        - seviyeden LIMIT_BREAK_CONFIRM_SEC saniye uzak kalınca 'bozuldu' (ya da dokunup tutunamadıysa)"""
         now_ts = self.clock()
         key = (t, side)
         st = self.limit.get(key)
         who = " (portföyünde)" if mine else ""
-        if not at:
-            if st is not None:
-                if st["off_since"] is None:
-                    st["off_since"] = now_ts
-                elif now_ts - st["off_since"] >= LIMIT_LEAVE_SEC:
-                    del self.limit[key]  # bozuldu; tekrar kilitlenirse yeni bildirim gelir
-            return []
         what = "alış" if side == "tavan" else "satış"
-        if st is None:
-            if not mine and self.limit_count >= MAX_LIMIT_MSGS:
+        if not at:
+            if st is None:
                 return []
-            st = self.limit[key] = {"peak": 0.0, "since": now_ts, "off_since": None, "s50": False, "s75": False}
-            if not mine:
-                self.limit_count += 1
-            icon = "🔒" if side == "tavan" else "🧊"
-            if qty:
-                st["peak"] = float(qty)
-                qtxt = (f"{side.capitalize()}da bekleyen {what}: {qty:,.0f} adet (yaklaşık {qty * last / 1e6:.1f} milyon TL)\n"
-                        f"Bu kuyruk %50 ve %75 eridiğinde ayrıca haber vereceğim.")
-            else:
-                qtxt = f"{side.capitalize()}da bekleyen {what} miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
-            return [f"{icon} {t}{who} {side} oldu\nFiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}"]
+            if st["off_since"] is None:
+                st["off_since"] = now_ts
+            off = now_ts - st["off_since"]
+            msgs = []
+            if off >= LIMIT_BREAK_CONFIRM_SEC and not st["broken"]:
+                st["broken"] = True
+                msgs = self._limit_broken(t, side, st, last, day, mine, level, who, what)
+            if off >= LIMIT_LEAVE_SEC:
+                del self.limit[key]
+            return msgs
+        if st is not None and st["broken"]:
+            del self.limit[key]      # bozulduktan sonra tekrar kilitlendi: yeni kayıt
+            st = None
+        if st is None:
+            st = self.limit[key] = {"peak": 0.0, "last_qty": 0.0, "since": now_ts, "off_since": None,
+                                    "announced": False, "broken": False, "muted": False,
+                                    "s50": False, "s75": False, "level": level}
         st["off_since"] = None
-        if not qty:
-            return []
-        qty = float(qty)
-        if qty > st["peak"]:
-            st["peak"] = qty
-            return []
+        if qty:
+            qty = float(qty)
+            st["last_qty"] = qty
+            if qty > st["peak"]:
+                st["peak"] = qty
+        msgs = []
+        icon = "🔒" if side == "tavan" else "🧊"
+        if not st["announced"] and now_ts - st["since"] >= LIMIT_CONFIRM_SEC:
+            st["announced"] = True
+            if not mine and self.limit_count >= MAX_LIMIT_MSGS:
+                st["muted"] = True
+            else:
+                if not mine:
+                    self.limit_count += 1
+                if st["peak"]:
+                    qtxt = (f"{side.capitalize()}da bekleyen {what}: {qty or st['last_qty']:,.0f} adet "
+                            f"(yaklaşık {(qty or st['last_qty']) * last / 1e6:.1f} milyon TL)\n"
+                            f"Değdiği andan beri kaydettiğim en yüksek kuyruk: {st['peak']:,.0f} adet. "
+                            f"Kuyruk %50 ve %75 eridiğinde haber vereceğim.")
+                else:
+                    qtxt = f"{side.capitalize()}da bekleyen {what} miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
+                msgs.append(f"{icon} {t}{who} {side} oldu ({LIMIT_CONFIRM_SEC} sn'dir {side}da)\n"
+                            f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}")
+        if st["muted"] or not qty:
+            return msgs
         peak = st["peak"]
         if peak * last < LIMIT_MIN_QUEUE_TL:
-            return []
+            return msgs
         ratio = qty / peak
         if side == "tavan":
             note = "Alıcılar çekilmiş ya da satışlar karşılanmış olabilir."
@@ -345,11 +401,46 @@ class Engine:
                 f"(%{(1 - ratio) * 100:.0f} azaldı)\n{note}")
         if ratio <= LIMIT_DROP_2 and not st["s75"]:
             st["s75"] = st["s50"] = True
-            return [t75 + "\n" + head]
-        if ratio <= LIMIT_DROP_1 and not st["s50"]:
+            msgs.append(t75 + "\n" + head)
+        elif ratio <= LIMIT_DROP_1 and not st["s50"]:
             st["s50"] = True
-            return [t50 + "\n" + head]
-        return []
+            msgs.append(t50 + "\n" + head)
+        return msgs
+
+    def periodic(self):
+        """Veri gelmese bile süreye bağlı kontroller (onay süresi, bozulma): ana döngü birkaç saniyede bir çağırır."""
+        msgs = []
+        with self.lock:
+            for t in sorted({k[0] for k in self.limit}):
+                try:
+                    msgs.extend(self._limit_check(t))
+                except Exception as e:
+                    print("periodic hatası", t, repr(e))
+        for m in msgs:
+            self.out.put(m)
+
+    def _limit_broken(self, t, side, st, last, day, mine, level, who, what):
+        """Fiyat seviyeden ayrıldı. Kayda değer bir kuyruk görüldüyse ya da tavan/taban bildirilmişse haber verir."""
+        if st["muted"]:
+            return []
+        peak, lastq = st["peak"], st["last_qty"]
+        big = peak * (level or last) >= LIMIT_MIN_QUEUE_TL
+        if not st["announced"]:
+            if not big or (not mine and self.touch_count >= MAX_TOUCH_MSGS):
+                return []
+            if not mine:
+                self.touch_count += 1
+            head = f"↘️ {t}{who} {side}a değdi ama tutunamadı"
+        else:
+            head = f"❌ {t}{who}: {side} bozuldu"
+        away = abs(last / level - 1) * 100 if level else 0
+        lines = [head, f"Fiyat şimdi: {last:.2f} TL ({side} seviyesi {level:.2f}, %{away:.1f} uzakta; bugün %{day:+.1f})"]
+        if peak:
+            drop = (1 - lastq / peak) * 100
+            lines.append(f"{side.capitalize()}dayken görülen en yüksek {what} kuyruğu: {peak:,.0f} adet → "
+                         f"ayrılmadan önce son görülen: {lastq:,.0f} adet (%{drop:.0f} azalmıştı)")
+        lines.append("Veri yaklaşık 15 dk gecikmeli olabilir, kendi uygulamandan kontrol et.")
+        return ["\n".join(lines)]
 
     def _win(self, t, secs, now_ts, last, vol, a):
         """Son 'secs' saniyedeki hareket ve hacim patlaması: (hareket %, hacim katı, süre, hareket TL)."""
@@ -496,6 +587,66 @@ class Engine:
                           f"(en az {BOOK_HOLD_SEC} sn'dir)",
                           f"Son 5 dakikada: %{w[0]:+.1f}"]}
 
+    def _ctrl_maybe(self, now_ts):
+        """Rastgele zamanlarda, uyarı koşullarının ön şartlarını (likit, dar fark, gün içi %0,5-7 artıda,
+        endeks düşüşte değil) taşıyan ama kalıp aramadan seçilmiş bir hisseyi izlemeye alır. Amaç: uyarılar bu
+        rastgele hisselerden gerçekten daha iyi mi? Bunlar için mesaj gönderilmez."""
+        if len(self.ctrl) >= CONTROL_MAX:
+            return
+        gap = lambda: self.rng.expovariate(1.0 / (CONTROL_MEAN_MIN * 60))
+        if self.next_ctrl is None:
+            self.next_ctrl = now_ts + gap()
+            return
+        if now_ts < self.next_ctrl:
+            return
+        self.next_ctrl = now_ts + gap()
+        if self.index_change is not None and self.index_change < INDEX_MIN_CHANGE:
+            return
+        taken = {r["sym"] for r in self.ctrl}
+        cands = []
+        for t, q in self.cache.items():
+            last, vol = q.get("last"), q.get("volume")
+            a = self.avg.get(t)
+            if not last or vol is None or not a or a["tl"] < MIN_AVG_TL_VOLUME or a["vol"] <= 0 or t in taken:
+                continue
+            bid, ask = q.get("bid") or 0, q.get("ask") or 0
+            if not (bid and ask and ask >= bid) or (ask - bid) / last * 100 > MAX_SPREAD:
+                continue
+            day = q.get("change_percent")
+            if day is None and q.get("prev_close"):
+                day = (last / q["prev_close"] - 1) * 100
+            if day is None or not (MIN_DAY_CHANGE <= day <= MAX_DAY_CHANGE):
+                continue
+            la = self.last_alert.get(t)
+            if la is not None and now_ts - la < COOLDOWN_MIN * 60:
+                continue
+            if len(self.hist[t]) < 2:
+                continue
+            cands.append(t)
+        if not cands:
+            return
+        t = self.rng.choice(sorted(cands))
+        q = self.cache[t]
+        last, vol, a = q["last"], q["volume"], self.avg[t]
+        bid, ask = q["bid"], q["ask"]
+        w5 = self._win(t, WINDOW_SEC, now_ts, last, vol, a)
+        w2 = self._win(t, 120, now_ts, last, vol, a)
+        day = q.get("change_percent")
+        if day is None:
+            day = (last / q["prev_close"] - 1) * 100
+        now_dt = now_tr()
+        self.ctrl.append({
+            "date": str(now_dt.date()), "time": now_dt.strftime("%H:%M:%S"), "sym": t, "pattern": "kontrol",
+            "price": last, "move": w5[0] if w5 else None, "day": day, "burst": w5[1] if w5 else None,
+            "spread": (ask - bid) / last * 100, "bid_size": q.get("bid_size"), "ask_size": q.get("ask_size"),
+            "index": self.index_change, "stop": last * (1 - STOP_PCT / 100), "target": last * (1 + TARGET_PCT / 100),
+            "ts": now_ts, "hi": last, "lo": last, "last": last, "p15": None, "p30": None, "p60": None,
+            "outcome": None, "closed": True, "ev": set(),
+            "b2": w2[1] if w2 else None, "upshare": self._upshare(t, now_ts),
+            "day_share": vol / a["vol"] if a["vol"] else None, "shadow": False,
+            "trace": [], "tmin": 0, "mlo": last, "mhi": last, "mcl": last,
+        })
+
     def _p_volume(self, c):
         w5, w2 = c["w5"], c["w2"]
         if not w5 or not w2 or c["upshare"] is None:
@@ -544,6 +695,7 @@ class Engine:
         mins = now_dt.hour * 60 + now_dt.minute
         if not (START_MIN <= mins < END_MIN):
             return None
+        self._ctrl_maybe(now_ts)
         if self.alert_count >= MAX_ALERTS_PER_SESSION:
             return None
         if self.index_change is not None and self.index_change < INDEX_MIN_CHANGE:
@@ -601,7 +753,7 @@ class Engine:
             "hi": last, "lo": last, "last": last, "p15": None, "p30": None, "p60": None,
             "outcome": None, "closed": False, "ev": set(),
             "b2": c["w2"][1] if c["w2"] else None, "upshare": c["upshare"], "day_share": c["day_share"],
-            "shadow": shadow,
+            "shadow": shadow, "trace": [], "tmin": 0, "mlo": last, "mhi": last, "mcl": last,
         })
         if shadow:
             return None
@@ -635,46 +787,72 @@ class Engine:
             f"⏳ Veri yaklaşık 15 dk gecikmeli olabilir, fiyatı kendi uygulamandan kontrol et."
         )
 
+    @staticmethod
+    def _row(r):
+        p = r["price"]
+        return {
+            "date": r["date"], "time": r["time"], "sym": r["sym"],
+            "pattern": r["pattern"],
+            "price": f"{p:.4f}", "move": f2(r["move"]), "day": f2(r["day"]),
+            "burst": f2(r["burst"]), "spread": f2(r["spread"]),
+            "bid_size": "" if r["bid_size"] is None else r["bid_size"],
+            "ask_size": "" if r["ask_size"] is None else r["ask_size"],
+            "index": f2(r["index"]), "stop": f"{r['stop']:.4f}",
+            "target": f"{r['target']:.4f}",
+            "ret15": f2(pct(r["p15"], p)), "ret30": f2(pct(r["p30"], p)),
+            "ret60": f2(pct(r["p60"], p)), "ret_end": f2(pct(r["last"], p)),
+            "mfe": f2(pct(r["hi"], p)), "mae": f2(pct(r["lo"], p)),
+            "outcome": r["outcome"] or "",
+            "b2": f2(r.get("b2")), "upshare": f2(r.get("upshare")), "day_share": f2(r.get("day_share")),
+            "shadow": "1" if r.get("shadow") else "",
+        }
+
     def finalize(self):
         with self.lock:
-            rows = []
-            for r in self.active:
-                p = r["price"]
-                rows.append({
-                    "date": r["date"], "time": r["time"], "sym": r["sym"],
-                    "pattern": r["pattern"],
-                    "price": f"{p:.4f}", "move": f2(r["move"]), "day": f2(r["day"]),
-                    "burst": f2(r["burst"]), "spread": f2(r["spread"]),
-                    "bid_size": "" if r["bid_size"] is None else r["bid_size"],
-                    "ask_size": "" if r["ask_size"] is None else r["ask_size"],
-                    "index": f2(r["index"]), "stop": f"{r['stop']:.4f}",
-                    "target": f"{r['target']:.4f}",
-                    "ret15": f2(pct(r["p15"], p)), "ret30": f2(pct(r["p30"], p)),
-                    "ret60": f2(pct(r["p60"], p)), "ret_end": f2(pct(r["last"], p)),
-                    "mfe": f2(pct(r["hi"], p)), "mae": f2(pct(r["lo"], p)),
-                    "outcome": r["outcome"] or "",
-                    "b2": f2(r.get("b2")), "upshare": f2(r.get("upshare")), "day_share": f2(r.get("day_share")),
-                    "shadow": "1" if r.get("shadow") else "",
-                })
-            return rows
+            return [self._row(r) for r in self.active]
+
+    def finalize_control(self):
+        with self.lock:
+            return [self._row(r) for r in self.ctrl]
+
+    def traces(self):
+        """Her kaydın dakikalık izi: 'alt,üst,kapanış;...' (sinyal fiyatına göre baz puan = %0,01)."""
+        rows = []
+        with self.lock:
+            for kind, recs in (("uyari", self.active), ("kontrol", self.ctrl)):
+                for r in recs:
+                    tr = list(r["trace"])
+                    if r["tmin"] < TRACE_MIN:
+                        tr.append((r["mlo"], r["mhi"], r["mcl"]))
+                    p = r["price"]
+                    bp = lambda x: int(round((x / p - 1) * 1e4))
+                    rows.append({
+                        "date": r["date"], "time": r["time"], "sym": r["sym"],
+                        "kind": "gölge" if r.get("shadow") else kind, "pattern": r["pattern"],
+                        "price": f"{p:.4f}", "spread": f2(r["spread"]),
+                        "trace": ";".join(f"{bp(a)},{bp(b)},{bp(c)}" for a, b, c in tr),
+                    })
+        return rows
 
 
-def write_log(rows):
+def write_log(rows, path=None, fields=None):
     if not rows:
         return
-    new = not os.path.exists(LOG_FILE)
+    path = path or LOG_FILE
+    fields = fields or LOG_FIELDS
+    new = not os.path.exists(path)
     if not new:
-        with open(LOG_FILE, encoding="utf-8", newline="") as f:
+        with open(path, encoding="utf-8", newline="") as f:
             rd = csv.DictReader(f)
             header = rd.fieldnames or []
-            old = list(rd) if header != LOG_FIELDS else None
+            old = list(rd) if header != fields else None
         if old is not None:   # eski sütun düzeni: yeni alanlarla baştan yaz (eski satırlar boş alan alır)
-            with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore", restval="")
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
                 w.writeheader()
                 w.writerows(old)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore", restval="")
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
         if new:
             w.writeheader()
         w.writerows(rows)
@@ -880,6 +1058,7 @@ def run_live():
                 safe_send(out.get(timeout=LOOP_WAIT))
             except queue.Empty:
                 pass
+            engine.periodic()
             now = now_tr()
             mins = now.hour * 60 + now.minute
             stale = engine.clock() - engine.last_tick > STALE_SEC
@@ -902,14 +1081,18 @@ def run_live():
         except Exception:
             pass
         rows = engine.finalize()
+        ctrl_rows = engine.finalize_control()
         try:
             write_log(rows)
+            write_log(ctrl_rows, CONTROL_FILE)
+            write_log(engine.traces(), TRACE_FILE, TRACE_FIELDS)
         except Exception as e:
             print("Kayıt yazılamadı:", repr(e))
     real = [r for r in rows if not r.get("shadow")]
     extra = (f"\nÖğrenilen filtreler yüzünden gönderilmeyen ama izlenen: {len(rows) - len(real)} uyarı"
              if len(real) != len(rows) else "")
-    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count} | Tavan olan hisse: {engine.limit_count}\n" + summary_text(real) + extra)
+    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count} | Tavan olan hisse: {engine.limit_count}\n" + summary_text(real) + extra
+              + (f"\nKontrol grubu: {len(ctrl_rows)} rastgele hisse izlendi (uyarılarla kıyaslamak için)" if ctrl_rows else ""))
 
 
 def run_report():
