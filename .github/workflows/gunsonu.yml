@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: "20 15 * * 1-5"   # 18:20 TRT, canlı takip bittikten sonra
   workflow_dispatch:
+permissions:
+  contents: write
 concurrency:
   group: bist-gunsonu
   cancel-in-progress: false
@@ -22,3 +24,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Öğrenilen filtreleri sakla
+        if: always()
+        run: |
+          if [ -f ogrenilen.json ]; then
+            git config user.name "bist-bot"
+            git config user.email "bist-bot@users.noreply.github.com"
+            git add ogrenilen.json
+            if ! git diff --staged --quiet; then
+              git commit -m "ogrenilen filtreler"
+              git pull --rebase
+              git push
+            fi
+          fi
