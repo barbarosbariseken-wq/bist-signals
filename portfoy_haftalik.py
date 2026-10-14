@@ -83,16 +83,15 @@ def run():
     if not week:
         send("⚠️ Haftalık portföy raporu için bu haftaya ait fiyat verisi yok.")
         return
-    cal = ([prev[-1]] if prev else [week[0]]) + [d for d in week if not prev or d != prev[-1]]
+    cal = ([prev[-1]] if prev else []) + week
     if not prev:
         warn.append("Geçen haftanın kapanışı yok; hafta başı olarak ilk kapanış alındı.")
-    cal = list(dict.fromkeys(cal))
 
     close = {}
     for s in syms:
         ser = px.get(s + ".IS")
         if ser is not None:
-            close[s] = ser.reindex(cal.copy() if False else sorted(set(cal) | set(ser.index))).ffill().reindex(cal)
+            close[s] = ser.reindex(sorted(set(cal) | set(ser.index))).ffill().reindex(cal)
 
     def hold(day):
         return dfr.holdings_at(ledger, day.strftime("%Y-%m-%d"), base)
@@ -102,7 +101,7 @@ def run():
         p, d = cal[i - 1], cal[i]
         H = hold(p)
         Hn = hold(d)
-        if i >= 1 and Hn != H:
+        if Hn != H:
             for line in dfr.diff_text(H, Hn):
                 events.append(f"{d:%d.%m}: {line}")
         for s, q in H.items():
@@ -111,7 +110,7 @@ def run():
                 missing.add(s)
                 continue
             pl = q * (float(c[d]) - float(c[p]))
-            e = per.setdefault(s, {"pl": 0.0, "entry": float(c[p]), "last": float(c[d]), "first": d, "lastday": d,
+            e = per.setdefault(s, {"pl": 0.0, "entry": float(c[p]), "last": float(c[d]), "first": d, "added": p, "lastday": d,
                                    "qtys": set()})
             e["pl"] += pl
             e["last"] = float(c[d])
@@ -138,6 +137,20 @@ def run():
          f"{icon} Haftalık kâr/zarar: {total_pl:+,.0f} TL" + (f" (%{pct:+.1f})" if pct is not None else "")]
     if abs(flow) >= 1:
         L.append(f"Hafta içi alım/satım etkisi: {flow:+,.0f} TL (bu tutar kâr/zarara dahil değildir)")
+    # maliyete göre durum (PORTFOY'daki maliyetler, hafta sonunda hâlâ elinde olan hisseler)
+    costs = {h["sym"]: h["cost"] for h in pf if h["cost"]}
+    held_end = hold(cal[-1])
+    cb = cv = 0.0
+    for sy, q in held_end.items():
+        c_ = close.get(sy)
+        if sy in costs and c_ is not None and not pd.isna(c_.get(cal[-1])):
+            cb += costs[sy] * q
+            cv += q * float(c_[cal[-1]])
+    if cb > 0:
+        L.append(f"Maliyetine göre toplam: {cv - cb:+,.0f} TL (%{(cv / cb - 1) * 100:+.1f}) | "
+                 f"maliyet {cb:,.0f} TL → şimdi {cv:,.0f} TL")
+        if any(sy not in costs for sy in held_end):
+            L.append("(Maliyeti yazılmayan hisseler bu toplama dahil değil.)")
     if idxs is not None and len(cal) > 1:
         ip = (float(idxs[cal[-1]]) / float(idxs[cal[0]]) - 1) * 100
         if pct is not None:
@@ -153,16 +166,24 @@ def run():
         mark = "🟢" if e["pl"] > 0.5 else "🔴" if e["pl"] < -0.5 else "⚪"
         note = []
         if e["first"] > cal[1]:
-            note.append(f"{e['first']:%d.%m} günü eklendi")
+            note.append(f"{e['added']:%d.%m} kapanışında eklendi")
         if e["lastday"] < cal[-1]:
             note.append("çıkarıldı")
         if len(e["qtys"]) > 1:
             note.append("lot değişti")
-        L.append(f"{mark} {s}: {e['entry']:.2f} → {e['last']:.2f} TL (%{p_:+.1f}) | {e['pl']:+,.0f} TL"
-                 + (f" ({', '.join(note)})" if note else ""))
+        line = (f"{mark} {s}: {e['entry']:.2f} → {e['last']:.2f} TL (%{p_:+.1f}) | {e['pl']:+,.0f} TL"
+                + (f" ({', '.join(note)})" if note else ""))
+        if s in costs and s in held_end:
+            line += f"\n   maliyetine göre: %{(e['last'] / costs[s] - 1) * 100:+.1f} (maliyet {costs[s]:.2f} TL)"
+        elif s in held_end:
+            line += "\n   maliyetine göre: maliyet yazılmamış"
+        L.append(line)
     if len(per) >= 2:
         b, w = max(per.items(), key=lambda kv: kv[1]["pl"]), min(per.items(), key=lambda kv: kv[1]["pl"])
-        L.append(f"\nEn çok kazandıran: {b[0]} ({b[1]['pl']:+,.0f} TL) | En çok kaybettiren: {w[0]} ({w[1]['pl']:+,.0f} TL)")
+        t = f"\nEn çok kazandıran: {b[0]} ({b[1]['pl']:+,.0f} TL)"
+        if w[1]["pl"] < 0:
+            t += f" | En çok kaybettiren: {w[0]} ({w[1]['pl']:+,.0f} TL)"
+        L.append(t)
     if missing:
         L.append(f"\nVeri alınamayan: {', '.join(sorted(missing))}")
     for w_ in warn:
