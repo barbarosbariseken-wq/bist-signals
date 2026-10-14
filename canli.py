@@ -377,7 +377,9 @@ class Engine:
                     qtxt = (f"{side.capitalize()}da bekleyen {what}: {qty or st['last_qty']:,.0f} adet "
                             f"(yaklaşık {(qty or st['last_qty']) * last / 1e6:.1f} milyon TL)\n"
                             f"Değdiği andan beri kaydettiğim en yüksek kuyruk: {st['peak']:,.0f} adet. "
-                            f"Kuyruk %50 ve %75 eridiğinde haber vereceğim.")
+                            f"Kuyruk %50 ve %75 eridiğinde haber vereceğim.\n"
+                            f"⚠️ Bu rakam TradingView'in verdiği alış/satış büyüklüğüdür ve gecikmeli olabilir; "
+                            f"brokerindeki toplam kuyrukla farklı çıkabilir.")
                 else:
                     qtxt = f"{side.capitalize()}da bekleyen {what} miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
                 msgs.append(f"{icon} {t}{who} {side} oldu ({LIMIT_CONFIRM_SEC} sn'dir {side}da)\n"
@@ -1168,6 +1170,74 @@ def run_test():
     safe_send("🔧 Bağlantı testi sonucu\n" + "\n".join(lines))
 
 
+def diag_text(syms, rows, secs):
+    """Teşhis raporu: ham akış verisi. Brokerdeki kuyrukla karşılaştırmak için."""
+    lines = [f"🔬 Veri teşhisi ({now_tr():%H:%M:%S}) | {secs} sn dinlendi | veri gecikmeli olabilir (~15 dk)"]
+    for t in syms:
+        rs = [(ts, q) for ts, sym, q in rows if sym == t]
+        lines.append(f"\n— {t}: {len(rs)} güncelleme geldi")
+        if not rs:
+            lines.append("Bu sürede hiç güncelleme gelmedi (hisse sakin olabilir ya da abonelik çalışmadı).")
+            continue
+        allkeys = sorted({k for _, q in rs for k in q})
+        lines.append("Gelen alanlar: " + ", ".join(allkeys))
+        bsz = [q.get("bid_size") for _, q in rs if q.get("bid_size") is not None]
+        asz = [q.get("ask_size") for _, q in rs if q.get("ask_size") is not None]
+        if bsz:
+            lines.append(f"bid_size (alış tarafı): en az {min(bsz):,.0f} | en çok {max(bsz):,.0f} | farklı değer sayısı {len(set(bsz))}")
+        else:
+            lines.append("bid_size hiç gelmedi")
+        if asz:
+            lines.append(f"ask_size (satış tarafı): en az {min(asz):,.0f} | en çok {max(asz):,.0f}")
+        else:
+            lines.append("ask_size hiç gelmedi")
+        pick = rs[:4] + ([("…", {})] if len(rs) > 8 else []) + rs[-4:] if len(rs) > 8 else rs
+        lines.append("Güncellemeler (sırayla):")
+        for ts, q in pick:
+            if ts == "…":
+                lines.append("   …")
+                continue
+            hh = time.strftime("%H:%M:%S", time.localtime(ts))
+            f = lambda k: ("-" if q.get(k) is None else (f"{q[k]:,.2f}" if isinstance(q[k], float) and abs(q[k]) < 1e5 else f"{q[k]:,}" if isinstance(q[k], (int, float)) else str(q[k])))
+            lines.append(f"   {hh} fiyat {f('last')} | alış {f('bid')} x {f('bid_size')} | satış {f('ask')} x {f('ask_size')} | hacim {f('volume')}")
+    lines.append("\nNasıl karşılaştırırsın: brokerinde bu hissenin 'alış' tarafındaki (tavan fiyatındaki) toplam bekleyen lot sayısını yaz. "
+                 "bid_size onunla aynı büyüklükteyse sorun yok; çok küçükse bu alan tavan kuyruğunu göstermiyor demektir.")
+    return "\n".join(lines)
+
+
+def run_diag():
+    """Seçilen hisselerin ham TradingView verisini kısa süre dinleyip Telegram'a yazar (TANI_SEMBOL, TANI_SURE)."""
+    import borsapy as bp
+
+    syms = [x.strip().upper() for x in os.environ.get("TANI_SEMBOL", "HUBVC").replace(",", " ").split() if x.strip()][:5]
+    secs = int(os.environ.get("TANI_SURE", "90") or 90)
+    auth = apply_auth(bp)
+    rows = []
+    stream = bp.TradingViewStream()
+    stream.connect()
+
+    def cb(sym, q):
+        t = str(sym).split(":")[-1]
+        if t in syms and isinstance(q, dict):
+            rows.append((time.time(), t, dict(q)))
+
+    stream.on_any_quote(cb)
+    for t in syms:
+        try:
+            stream.subscribe(t)
+        except Exception as e:
+            print("abonelik başarısız:", t, repr(e))
+    time.sleep(secs)
+    try:
+        stream.disconnect()
+    except Exception:
+        pass
+    text = f"TradingView hesabı: {auth}\n" + diag_text(syms, rows, secs)
+    while text:
+        safe_send(text[:3900])
+        text = text[3900:]
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "canli"
     try:
@@ -1175,6 +1245,8 @@ def main():
             run_test()
         elif mode == "rapor":
             run_report()
+        elif mode == "tani":
+            run_diag()
         else:
             run_live()
     except Exception as e:
