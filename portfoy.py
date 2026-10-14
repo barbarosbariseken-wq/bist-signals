@@ -119,6 +119,74 @@ ICON = {"boz": "🔻", "boz_zirve": "🔻", "tavan_boz": "🔻", "boz_gun": "�
 TITLE = {"🔻": "bozulma işareti", "🛑": "stop seviyesi", "🚀": "yükseliş başladı", "🎯": "hedef"}
 
 
+MILESTONES = (500_000, 1_000_000, 1_500_000)
+
+
+def tl(x):
+    return f"{x:,.0f}".replace(",", ".") + " TL"
+
+
+def milestone_text(m, value):
+    """Her kilometre taşı için bir kez gönderilen kutlama mesajı."""
+    if m == 500_000:
+        return (f"🎉 YARIM MİLYON! 🎉\n\n"
+                f"Portföyünün değeri şu an {tl(value)}.\n\n"
+                "Bir zamanlar hayal olan sayı artık hesabında duruyor. İlk yarım milyon, en zor olanıdır; "
+                "çünkü sonrasında para da senin için çalışmaya başlar.\n"
+                "Ertelediğin hayallerin ilk durağına geldin. Kendine bir teşekkür et: bunu sabırla, plan yaparak, "
+                "her hafta raporlara bakarak sen yaptın. 🌱\n\n"
+                "Yola devam: sıradaki durak 1 milyon.")
+    if m == 1_000_000:
+        return (f"🥂 1.000.000 TL! 7 haneli kulübe hoş geldin 🥂\n\n"
+                f"Portföyünün değeri şu an {tl(value)}.\n\n"
+                "Bir milyon sadece bir sayı değil: sabahları kaygısız uyanabilmek, hayallerini takvime yazabilmek, "
+                "'ileride' dediğin şeylerin artık 'yakında'ya dönmesi demek. ✨\n"
+                "Bu noktaya gelmek disiplin ister; hem kazandığında hem düştüğünde sakin kalmayı bilmen buraya "
+                "getirdi seni. Gurur duy.\n\n"
+                "Bir sonraki durak: 1,5 milyon. Ve orada seni bir Scirocco bekliyor olabilir. 😉")
+    return (f"🏎️💨 1.500.000 TL! SCIROCCO ZAMANI! 💨🏎️\n\n"
+            f"Portföyünün değeri şu an {tl(value)}.\n\n"
+            "Scirocco adını Sahra'dan Akdeniz'e esen sıcak rüzgârdan alır; hayalin de tam böyle, çöl sıcağında "
+            "başlayıp ufka doğru esen bir rüzgâr gibiydi. Alçak, keskin çizgili o coupé'nin anahtarını eline "
+            "aldığın, motoru ilk çalıştırdığın, direksiyonu kavrayıp yola çıktığın anı hayal et. 🔑\n"
+            "Bu hayali yıllarca taşıdın. Şimdi artık bir 'keşke' değil, masadaki gerçek bir seçenek.\n\n"
+            "Bir not: karar tamamen senin. Araç alırken vergi, sigorta ve bakım masraflarını ve portföyünün ne "
+            "kadarını bozacağını bir kez daha hesaplamak isteyebilirsin. Ama bu mesajı okuyorsan, yeterince "
+            "yürüdün. Tebrikler, kaptan! 🏁")
+
+
+def check_milestones(pf, bars, now_value=None):
+    """Portföy değeri (lotu yazılı hisseler, son iki 15 dk'lık mum da) bir kilometre taşını aştıysa, ve bu taş
+    daha önce kutlanmadıysa mesaj listesi döner. Durum şifreli portfoy_hedef.enc dosyasında tutulur."""
+    holds = {}
+    for h in pf:
+        if h["qty"]:
+            holds[h["sym"]] = holds.get(h["sym"], 0) + h["qty"]
+    if not holds or not os.environ.get("SNAPSHOT_KEY", "").strip():
+        return None
+    v_now = v_prev = 0.0
+    for sy, q in holds.items():
+        df = bars.get(sy)
+        if df is None or len(df) < 2:
+            return None   # eksik veri: yanlış karar verme
+        v_now += q * float(df["Close"].iloc[-1])
+        v_prev += q * float(df["Close"].iloc[-2])
+    value = v_now
+    reached = [m for m in MILESTONES if v_now >= m and v_prev >= m]   # iki mum üst üste: tek hatalı fiyat sayılmaz
+    if not reached:
+        return None
+    import portfoy_defter as dfr
+    goals = dfr.load_goals()
+    new = [m for m in reached if str(m) not in goals]
+    if not new:
+        return None
+    today = now_tr().strftime("%Y-%m-%d")
+    for m in new:
+        goals[str(m)] = today
+    dfr.save_goals(goals)    # önce kaydet: mesaj iki kez gitmesin
+    return [milestone_text(m, value) for m in sorted(new)]
+
+
 def run():
     pf = parse_portfolio(os.environ.get("PORTFOY", ""))
     if not pf:
@@ -183,6 +251,11 @@ def run():
                 body += f" | maliyete göre %{(last / h['cost'] - 1) * 100:+.1f}"
             body += "\nBu bir bilgilendirmedir, tavsiye değildir."
             alerts.append(body)
+    try:
+        for ms in check_milestones(pf, bars) or []:
+            send(ms)
+    except Exception as e:
+        print("kilometre taşı kontrolü hatası:", repr(e))
     for a in alerts:
         send(a)
     head = f"📋 Portföy durumu ({now:%H:%M})"
