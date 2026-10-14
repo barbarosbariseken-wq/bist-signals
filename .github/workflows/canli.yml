@@ -47,6 +47,7 @@ jobs:
             git add alerts.csv
             [ -f kontrol.csv ] && git add kontrol.csv
             [ -f izler.csv ] && git add izler.csv
+            [ -f dusus.csv ] && git add dusus.csv
             if ! git diff --staged --quiet; then
               git commit -m "alerts"
               git pull --rebase
