@@ -24,7 +24,7 @@ SPREAD_MOVE_RATIO = 0.5 # fark, pencere hareketinin en fazla yarısı (işlem ma
 COOLDOWN_MIN = 60       # aynı hisse için iki bildirim arası (dk)
 START_MIN = 10 * 60 + 15  # açılış gürültüsü: 10:15'ten önce uyarı yok
 END_MIN = 17 * 60 + 40    # kapanışa yakın: 17:40'tan sonra uyarı yok
-MAX_ALERTS_PER_SESSION = 8
+MAX_ALERTS_PER_SESSION = 10
 INDEX_SYMBOL = "XU100"
 INDEX_MIN_CHANGE = -1.5 # endeks günlük bu seviyenin altındaysa uyarı yok (piyasa düşüşte)
 STOP_PCT = 2.0          # örnek stop (%) - ve ileri testte "stop" ölçütü
@@ -54,7 +54,19 @@ BOOK_HOLD_SEC = 30         # ... ve bu durum en az 30 sn sürmüş
 BOOK_MIN_MOVE = 0.5        # tahta: son 5 dk'da en az %0,5 yükselmiş
 BOOK_MIN_BURST = 1.5
 PATTERN_NAMES = {"ivme": "Hızlı yükseliş", "kirilim": "Dar aralık kırılımı",
-                 "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı"}
+                 "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı",
+                 "hacim_oncu": "Hacim öncüsü"}
+# --- hacim öncüsü: fiyat henüz az oynamışken hacmin hızlandığını ve alıcıların baskın olduğunu yakalar ---
+VOL_PRE_BURST5 = 3.0       # son 5 dk hacmi normalin en az 3 katı
+VOL_PRE_BURST2 = 3.0       # son 2 dk hacmi de en az 3 kat ve 5 dk'lık hızdan düşük değil (hızlanıyor)
+VOL_PRE_UPSHARE = 0.60     # işlem hacminin en az %60'ı yükselen fiyatta (alıcı yönlü) gerçekleşmiş
+VOL_PRE_MIN_MOVE = 0.2     # son 5 dk'da en az %0,2 yükselmiş (hareket başlıyor) ...
+                           # ... ama MIN_WINDOW_MOVE'dan az: büyük hareket zaten "Hızlı yükseliş" uyarısı olur
+VOL_PRE_NEAR_HIGH = 0.985  # fiyat günün zirvesinin en az %98,5'inde
+VOL_PRE_MAX_SPREAD = 0.6   # alış-satış farkı en fazla %0,6 (hareket küçükken maliyet yemesin)
+UPSHARE_WIN = 300          # alıcı yönlü hacim oranı için pencere (sn)
+LEARN_FILE = "ogrenilen.json"  # gün sonu raporunun çıkardığı filtreler (gunsonu.py yazar)
+MAX_SHADOW_PER_SESSION = 30    # filtrelenen (gönderilmeyen) ama izlenen uyarıların üst sınırı
 # --- tavan takibi ---
 LIMIT_PCT = 10.0            # günlük fiyat sınırı (%)
 LIMIT_MIN_DAY = 9.5         # en az bu kadar yükselmişse tavan sayılabilir
@@ -72,7 +84,7 @@ MAX_BLOCKS_PER_SESSION = 10
 LOG_FILE = "alerts.csv"
 LOG_FIELDS = ["date", "time", "sym", "pattern", "price", "move", "day", "burst", "spread", "bid_size",
               "ask_size", "index", "stop", "target", "ret15", "ret30", "ret60", "ret_end",
-              "mfe", "mae", "outcome"]
+              "mfe", "mae", "outcome", "b2", "upshare", "day_share", "shadow"]
 
 CLOCK = time.time
 
@@ -88,8 +100,10 @@ def f2(x):
 
 
 class Engine:
-    def __init__(self, avg, out, clock=None, portfolio=()):
+    def __init__(self, avg, out, clock=None, portfolio=(), learned=None):
         self.portfolio = set(portfolio)
+        self.learned = learned or {}
+        self.shadow_count = 0
         names = list(TICKERS) + [p for p in self.portfolio if p not in TICKERS]
         self.avg = avg
         self.out = out
@@ -151,7 +165,8 @@ class Engine:
                     r["outcome"] = "stop"
                 elif last >= r["target"]:
                     r["outcome"] = "hedef"
-            msgs.extend(self._exit_msgs(r, last, el))
+            if not r.get("shadow"):
+                msgs.extend(self._exit_msgs(r, last, el))
         return msgs
 
     def _exit_msgs(self, r, last, el):
@@ -356,6 +371,51 @@ class Engine:
         burst = vol_delta / (a["vol"] / 96 * (eff / 300)) if vol_delta > 0 else 0.0
         return move, burst, eff, move_abs
 
+    def _upshare(self, t, now_ts, secs=UPSHARE_WIN):
+        """Son 'secs' sn'deki hacmin ne kadarı fiyat yükselirken (alıcı yönlü) gerçekleşti (0-1).
+        Yöntem: hacim artışı, fiyat bir önceki güncellemeye göre arttıysa alıcıya, azaldıysa satıcıya yazılır;
+        fiyat değişmediyse son yöne yazılır (yön yoksa yarı yarıya). Kesin veri değil, tahmindir."""
+        samples = [s for s in self.hist[t] if s[0] >= now_ts - secs]
+        if len(samples) < 6:
+            return None
+        up = down = 0.0
+        sign = 0
+        for a, b in zip(samples, samples[1:]):
+            dv = b[2] - a[2]
+            if dv <= 0:
+                continue
+            dp = b[1] - a[1]
+            if dp > 0:
+                sign = 1
+            elif dp < 0:
+                sign = -1
+            if sign > 0:
+                up += dv
+            elif sign < 0:
+                down += dv
+            else:
+                up += dv / 2
+                down += dv / 2
+        tot = up + down
+        return up / tot if tot > 0 else None
+
+    def _learn_block(self, res, c):
+        """Gün sonu raporunun öğrendiği filtreler. Engelliyorsa nedeni döner (uyarı gönderilmez ama izlenir)."""
+        L = self.learned
+        if not L:
+            return None
+        if res["pattern"] in L.get("kapali_kaliplar", []):
+            return "kalıp kapalı"
+        w5 = c["w5"]
+        burst = w5[1] if w5 else None
+        if L.get("min_burst") and burst is not None and burst < L["min_burst"]:
+            return f"hacim artışı {burst:.1f} < {L['min_burst']}"
+        if L.get("max_spread") and c["spread"] > L["max_spread"]:
+            return f"alış-satış farkı {c['spread']:.1f} > {L['max_spread']}"
+        if L.get("min_upshare") and c["upshare"] is not None and c["upshare"] < L["min_upshare"]:
+            return f"alıcı yönlü oran {c['upshare']:.2f} < {L['min_upshare']}"
+        return None
+
     # --- kalıplar: her biri uygunsa {"pattern","title","lines",...} döner ---
     def _p_momentum(self, c):
         w = c["w5"]
@@ -436,6 +496,29 @@ class Engine:
                           f"(en az {BOOK_HOLD_SEC} sn'dir)",
                           f"Son 5 dakikada: %{w[0]:+.1f}"]}
 
+    def _p_volume(self, c):
+        w5, w2 = c["w5"], c["w2"]
+        if not w5 or not w2 or c["upshare"] is None:
+            return None
+        move5, b5 = w5[0], w5[1]
+        move2, b2 = w2[0], w2[1]
+        if b5 < VOL_PRE_BURST5 or b2 < VOL_PRE_BURST2 or b2 < b5:
+            return None
+        if c["w15"] and b5 < c["w15"][1]:
+            return None           # hacim son 15 dk'ya göre de artıyor olmalı
+        if c["upshare"] < VOL_PRE_UPSHARE:
+            return None
+        if not (VOL_PRE_MIN_MOVE <= move5 < MIN_WINDOW_MOVE) or move2 < 0:
+            return None
+        if c["last"] < VOL_PRE_NEAR_HIGH * c["high"]:
+            return None
+        if c["spread"] > VOL_PRE_MAX_SPREAD:
+            return None
+        return {"pattern": "hacim_oncu", "title": f"🔊 {c['t']}: hacim hızla artıyor, yükseliş başlıyor olabilir",
+                "lines": [f"Son 2 dakikada hacim normalin {b2:.1f} katı, son 5 dakikada {b5:.1f} katı (hızlanıyor)",
+                          f"İşlemlerin yaklaşık %{c['upshare'] * 100:.0f}'i alıcı yönlü",
+                          f"Fiyat henüz yalnızca %{move5:+.1f} oynadı (hareket yeni başlıyor)"]}
+
     def _entry_check(self, t, quote):
         now_ts = self.clock()
         self.last_tick = now_ts
@@ -485,14 +568,21 @@ class Engine:
         high = q.get("high") or last
 
         c = {"t": t, "now": now_ts, "last": last, "vol": vol, "day": day, "high": high,
-             "spread": spread, "w5": self._win(t, WINDOW_SEC, now_ts, last, vol, a)}
+             "spread": spread, "w5": self._win(t, WINDOW_SEC, now_ts, last, vol, a),
+             "w2": self._win(t, 120, now_ts, last, vol, a), "w15": self._win(t, 900, now_ts, last, vol, a),
+             "upshare": self._upshare(t, now_ts), "day_share": vol / a["vol"] if a["vol"] else None}
         res = None
-        for fn in (self._p_momentum, self._p_breakout, self._p_pullback, self._p_book):
+        for fn in (self._p_momentum, self._p_breakout, self._p_pullback, self._p_book, self._p_volume):
             res = fn(c)
             if res:
                 break
         if not res:
             return None
+        shadow = self._learn_block(res, c) is not None
+        if shadow:
+            if self.shadow_count >= MAX_SHADOW_PER_SESSION:
+                return None
+            self.shadow_count += 1
 
         w5 = c["w5"]
         move = w5[0] if w5 else None
@@ -500,7 +590,8 @@ class Engine:
         stop = res.get("stop") or last * (1 - STOP_PCT / 100)
         target = last * (1 + TARGET_PCT / 100)
         self.last_alert[t] = now_ts
-        self.alert_count += 1
+        if not shadow:
+            self.alert_count += 1
         self.active.append({
             "date": str(now_dt.date()), "time": now_dt.strftime("%H:%M:%S"), "sym": t,
             "pattern": res["pattern"],
@@ -509,9 +600,26 @@ class Engine:
             "index": self.index_change, "stop": stop, "target": target, "ts": now_ts,
             "hi": last, "lo": last, "last": last, "p15": None, "p30": None, "p60": None,
             "outcome": None, "closed": False, "ev": set(),
+            "b2": c["w2"][1] if c["w2"] else None, "upshare": c["upshare"], "day_share": c["day_share"],
+            "shadow": shadow,
         })
+        if shadow:
+            return None
         stop_pct = (1 - stop / last) * 100
         burst_txt = f"İşlem hacmi: normalin {burst:.1f} katı\n" if burst is not None else ""
+        det = []
+        if c["w2"]:
+            det.append(f"son 2 dk {c['w2'][1]:.1f} kat")
+        if burst is not None:
+            det.append(f"son 5 dk {burst:.1f} kat")
+        if c["w15"]:
+            det.append(f"son 15 dk {c['w15'][1]:.1f} kat")
+        if c["upshare"] is not None:
+            det.append(f"işlemlerin %{c['upshare'] * 100:.0f}'i alıcı yönlü")
+        if c["day_share"] is not None:
+            det.append(f"bugünkü hacim normal günün %{c['day_share'] * 100:.0f}'i")
+        if det:
+            burst_txt += "Hacim ayrıntısı: " + " | ".join(det) + "\n"
         return (
             f"{res['title']}\n"
             + "\n".join(res["lines"]) + "\n"
@@ -545,6 +653,8 @@ class Engine:
                     "ret60": f2(pct(r["p60"], p)), "ret_end": f2(pct(r["last"], p)),
                     "mfe": f2(pct(r["hi"], p)), "mae": f2(pct(r["lo"], p)),
                     "outcome": r["outcome"] or "",
+                    "b2": f2(r.get("b2")), "upshare": f2(r.get("upshare")), "day_share": f2(r.get("day_share")),
+                    "shadow": "1" if r.get("shadow") else "",
                 })
             return rows
 
@@ -553,8 +663,18 @@ def write_log(rows):
     if not rows:
         return
     new = not os.path.exists(LOG_FILE)
+    if not new:
+        with open(LOG_FILE, encoding="utf-8", newline="") as f:
+            rd = csv.DictReader(f)
+            header = rd.fieldnames or []
+            old = list(rd) if header != LOG_FIELDS else None
+        if old is not None:   # eski sütun düzeni: yeni alanlarla baştan yaz (eski satırlar boş alan alır)
+            with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore", restval="")
+                w.writeheader()
+                w.writerows(old)
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore", restval="")
         if new:
             w.writeheader()
         w.writerows(rows)
@@ -578,7 +698,8 @@ def report_text(path=None):
     if not os.path.exists(path):
         return "📊 Henüz kayıtlı uyarı yok."
     with open(path, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+        allrows = list(csv.DictReader(f))
+    rows = [r for r in allrows if not r.get("shadow")]
     n = len(rows)
     if n == 0:
         return "📊 Henüz kayıtlı uyarı yok."
@@ -624,6 +745,8 @@ def report_text(path=None):
         st = sum(1 for r in rs if r["outcome"] == "stop")
         lines.append(f"{name}: {len(rs)} uyarı | hedef {h} | zarar durdur {st} | 60 dk sonra ort. "
                      + show(mean(vals("ret60", rs))))
+    if len(allrows) > n:
+        lines.append(f"Öğrenilen filtreler yüzünden gönderilmeyen ama izlenen uyarı: {len(allrows) - n} adet.")
     if n < 30:
         lines.append("Not: 30'dan az uyarıyla sonuçlar rastlantı olabilir, para koymak için erken.")
     return "\n".join(lines)
@@ -648,6 +771,46 @@ def apply_auth(bp):
         print("TradingView girişi başarısız:", repr(e))
         return "giriş BAŞARISIZ"
     return "giriş yok (veri yaklaşık 15 dk gecikmeli)"
+
+
+def load_learned(path=None):
+    """ogrenilen.json'u okur ve sınırlar içine çeker (filtreler sadece sıkılaştırabilir, sınırlıdır)."""
+    path = path or LEARN_FILE
+    try:
+        import json
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    try:
+        if d.get("min_burst"):
+            out["min_burst"] = min(max(float(d["min_burst"]), MIN_VOL_BURST), 6.0)
+        if d.get("max_spread"):
+            out["max_spread"] = min(max(float(d["max_spread"]), 0.4), MAX_SPREAD)
+        if d.get("min_upshare"):
+            out["min_upshare"] = min(max(float(d["min_upshare"]), 0.0), 0.65)
+        kp = [k for k in d.get("kapali_kaliplar", []) if k in PATTERN_NAMES]
+        if kp:
+            out["kapali_kaliplar"] = kp
+    except (TypeError, ValueError):
+        return {}
+    return out
+
+
+def learned_text(L):
+    if not L:
+        return ""
+    parts = []
+    if L.get("kapali_kaliplar"):
+        parts.append("kapalı kalıp: " + ", ".join(PATTERN_NAMES[k] for k in L["kapali_kaliplar"]))
+    if L.get("min_burst"):
+        parts.append(f"hacim artışı en az {L['min_burst']:g} kat")
+    if L.get("max_spread"):
+        parts.append(f"alış-satış farkı en fazla %{L['max_spread']:g}")
+    if L.get("min_upshare"):
+        parts.append(f"alıcı yönlü oran en az %{L['min_upshare'] * 100:.0f}")
+    return "Öğrenilen filtreler: " + "; ".join(parts) + "\n"
 
 
 def portfolio_symbols():
@@ -697,7 +860,8 @@ def run_live():
         raise RuntimeError("Ortalama hacim verisi alınamadı")
     out = queue.Queue()
     pf = portfolio_symbols()
-    engine = Engine(avg, out, portfolio=pf)
+    learned = load_learned()
+    engine = Engine(avg, out, portfolio=pf, learned=learned)
     stream = open_stream(bp, engine)
     end = session_end(now_tr())
     safe_send(
@@ -705,6 +869,7 @@ def run_live():
         f"Takip edilen hisse: {len(avg)} / {len(TICKERS)}"
         + (f" + portföy: {', '.join(pf)}" if pf else "") + "\n"
         f"TradingView hesabı: {auth}\n"
+        + learned_text(learned) +
         f"Bu oturum {end:%H:%M}'de bitecek"
     )
 
@@ -741,7 +906,10 @@ def run_live():
             write_log(rows)
         except Exception as e:
             print("Kayıt yazılamadı:", repr(e))
-    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count} | Tavan olan hisse: {engine.limit_count}\n" + summary_text(rows))
+    real = [r for r in rows if not r.get("shadow")]
+    extra = (f"\nÖğrenilen filtreler yüzünden gönderilmeyen ama izlenen: {len(rows) - len(real)} uyarı"
+             if len(real) != len(rows) else "")
+    safe_send(f"🔴 Canlı takip bitti\nYükseliş uyarısı: {engine.alert_count} | Büyük alım bildirimi: {engine.block_count} | Tavan olan hisse: {engine.limit_count}\n" + summary_text(real) + extra)
 
 
 def run_report():
