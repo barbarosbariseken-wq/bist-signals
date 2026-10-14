@@ -9,6 +9,7 @@
 Kullanım: python gunsonu.py"""
 import csv
 import json
+import math
 import os
 import sys
 
@@ -23,6 +24,8 @@ WEEK_FILE = "weekly.csv"
 MIN_SAMPLES = 20          # istatistik yorumu için en az uyarı
 MIN_BUCKET = 6            # bir koşulun yorumlanması için en az örnek
 GAP_POINTS = 15           # genel başarıdan en az bu kadar puan kötü olan koşul işaretlenir
+CONTROL_FILE = "kontrol.csv"   # canlı takibin rastgele seçtiği kontrol hisseleri
+MIN_COMPARE = 10               # uyarı-kontrol kıyası için her gruptan en az kayıt
 LEARN_FILE = "ogrenilen.json"
 MIN_LEARN = 30            # filtre yazmak için en az sonuçlanmış uyarı
 LEARN_BUCKET = 8          # bir filtrenin gerekçesi için koşuldaki en az uyarı
@@ -288,6 +291,41 @@ def learn(rows_all):
     return out, notes
 
 
+def _ms(vals):
+    n = len(vals)
+    if n == 0:
+        return None
+    m = sum(vals) / n
+    sd = math.sqrt(sum((v - m) ** 2 for v in vals) / (n - 1)) if n > 1 else 0.0
+    return n, m, (sd / math.sqrt(n) if n > 1 else float("inf"))
+
+
+def compare_control(alert_rows, ctrl_rows):
+    """Uyarılar rastgele (kontrol) hisselerden iyi mi? 60 dk sonraki getiri ve tutma oranı."""
+    dates = {r.get("date") for r in ctrl_rows}
+    al = [r for r in alert_rows if r.get("date") in dates and not r.get("shadow")]
+    lines = ["Uyarılar rastgele hisselerden iyi mi? (kontrol grubu)"]
+    if len(ctrl_rows) < MIN_COMPARE or len(al) < MIN_COMPARE:
+        lines.append(f"Kıyas için kayıt yetmiyor (uyarı {len(al)}, kontrol {len(ctrl_rows)}; ikisinde de en az {MIN_COMPARE} gerek).")
+        return lines
+    for label, key in (("60 dk sonraki getiri", "ret60"), ("seans sonu getiri", "ret_end")):
+        a = _ms([fl(r.get(key)) for r in al if fl(r.get(key)) is not None])
+        c = _ms([fl(r.get(key)) for r in ctrl_rows if fl(r.get(key)) is not None])
+        if not a or not c:
+            continue
+        diff = a[1] - c[1]
+        se = math.sqrt(a[2] ** 2 + c[2] ** 2)
+        z = diff / se if se and se != float("inf") else 0.0
+        verdict = ("fark rastlantı olabilir" if abs(z) < 2 else
+                   "uyarılar belirgin daha iyi" if z > 0 else "uyarılar belirgin daha KÖTÜ")
+        lines.append(f"- {label}: uyarılar %{a[1]:+.2f} ({a[0]} adet) | rastgele hisseler %{c[1]:+.2f} ({c[0]} adet) → {verdict}")
+    wa, wc = wr(al)[0], wr(ctrl_rows)[0]
+    if wa is not None and wc is not None:
+        lines.append(f"- Tutma oranı: uyarılar %{wa:.0f} | rastgele hisseler %{wc:.0f}")
+    lines.append("Rastgele hisse = aynı ön şartlara (likit, dar fark, gün içi artıda) uyan ama kalıp aranmadan seçilmiş hisse.")
+    return lines
+
+
 def filters_text(f):
     if not f:
         return "yok"
@@ -444,6 +482,10 @@ def run():
 
     # 3) dersler
     parts.append("\n🎓 Öğrenilenler:\n" + "\n".join(lessons(rows_all)))
+    try:
+        parts.append("\n" + "\n".join(compare_control(rows_all, read_csv(CONTROL_FILE))))
+    except Exception as e:
+        print("kontrol kıyası hatası:", repr(e))
     try:
         parts.append("\n" + "\n".join(apply_learning(rows_all, todays_str)))
     except Exception as e:
