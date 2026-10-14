@@ -103,7 +103,8 @@ LIMIT_BREAK_CONFIRM_SEC = 10  # seviyeden bu kadar süre uzak kalınca "bozuldu"
 MAX_TOUCH_MSGS = 15         # "değdi ama tutunamadı" bildirimleri için oturum üst sınırı
 LIMIT_START_MIN = 10 * 60   # tavan bildirimleri 10:00-17:50 arası
 LIMIT_END_MIN = 17 * 60 + 50
-LIMIT_MIN_QUEUE_TL = 200_000  # en yüksek kuyruk bunun altındaysa azalma bildirimi yapılmaz (gürültü)
+LIMIT_MIN_QUEUE_TL = 50_000  # en yüksek kuyruk bunun altındaysa azalma bildirimi yapılmaz (gürültü)
+LIMIT_WATCH_MIN = 20           # tavana/tabana değdikten sonra kuyruk bu kadar dakika izlenir
 LIMIT_DROP_1 = 0.50         # kuyruk bu orana (en yüksek kuyruğun %50'sine) inince ilk bildirim
 LIMIT_DROP_2 = 0.25         # %75 azalınca ikinci bildirim
 MAX_LIMIT_MSGS = 40
@@ -407,19 +408,13 @@ class Engine:
             else:
                 if not mine:
                     self.limit_count += 1
-                if st["peak"]:
-                    qtxt = (f"{side.capitalize()}da bekleyen {what}: {qty or st['last_qty']:,.0f} adet "
-                            f"(yaklaşık {(qty or st['last_qty']) * last / 1e6:.1f} milyon TL)\n"
-                            f"Değdiği andan beri kaydettiğim en yüksek kuyruk: {st['peak']:,.0f} adet. "
-                            f"Kuyruk %50 ve %75 eridiğinde haber vereceğim.\n"
-                            f"⚠️ Bu rakam TradingView'in verdiği alış/satış büyüklüğüdür ve gecikmeli olabilir; "
-                            f"brokerindeki toplam kuyrukla farklı çıkabilir.")
-                else:
-                    qtxt = f"{side.capitalize()}da bekleyen {what} miktarı verisi gelmiyor, kuyruk uyarısı yapılamaz."
                 msgs.append(f"{icon} {t}{who} {side} oldu ({LIMIT_CONFIRM_SEC} sn'dir {side}da)\n"
-                            f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n{qtxt}")
+                            f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n"
+                            f"Kuyruğu sessizce izliyorum; {LIMIT_WATCH_MIN} dk içinde belirgin eriyorsa haber vereceğim.")
         if st["muted"] or not qty:
             return msgs
+        if now_ts - st["since"] > LIMIT_WATCH_MIN * 60:
+            return msgs          # izleme süresi doldu: artık kuyruk uyarısı yok
         peak = st["peak"]
         if peak * last < LIMIT_MIN_QUEUE_TL:
             return msgs
@@ -434,7 +429,8 @@ class Engine:
             t75 = f"🚨 {t}{who}: tabandaki satış kuyruğu %75 azaldı, taban bozulabilir"
         head = (f"Fiyat: {last:.2f} TL (bugün %{day:+.1f})\n"
                 f"Takip ettiğim en yüksek kuyruk: {peak:,.0f} adet → şimdi {qty:,.0f} adet "
-                f"(%{(1 - ratio) * 100:.0f} azaldı)\n{note}")
+                f"(%{(1 - ratio) * 100:.0f} azaldı)\n{note}\n"
+                "(TradingView verisi: brokerdeki toplam kuyruktan farklı olabilir, uygulamandan kontrol et.)")
         if ratio <= LIMIT_DROP_2 and not st["s75"]:
             st["s75"] = st["s50"] = True
             msgs.append(t75 + "\n" + head)
