@@ -171,7 +171,7 @@ def run():
             note.append("çıkarıldı")
         if len(e["qtys"]) > 1:
             note.append("lot değişti")
-        line = (f"{mark} {s}: {e['entry']:.2f} → {e['last']:.2f} TL (%{p_:+.1f}) | {e['pl']:+,.0f} TL"
+        line = (f"{mark} {s}: hafta başı fiyatı {e['entry']:.2f} → şimdi {e['last']:.2f} TL (%{p_:+.1f}) | {e['pl']:+,.0f} TL"
                 + (f" ({', '.join(note)})" if note else ""))
         if s in costs and s in held_end:
             line += f"\n   maliyetine göre: %{(e['last'] / costs[s] - 1) * 100:+.1f} (maliyet {costs[s]:.2f} TL)"
