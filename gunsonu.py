@@ -24,13 +24,16 @@ WEEK_FILE = "weekly.csv"
 MIN_SAMPLES = 20          # istatistik yorumu için en az uyarı
 MIN_BUCKET = 6            # bir koşulun yorumlanması için en az örnek
 GAP_POINTS = 15           # genel başarıdan en az bu kadar puan kötü olan koşul işaretlenir
+DOWN_FILE = "dusus.csv"          # canlı takibin düşüş uyarıları
+DOWN_NAMES = {"sert_dusus": "Hızlı düşüş", "aralik_asagi": "Aralığı aşağı kırma", "satis_oncu": "Satış hacmi öncüsü"}
 CONTROL_FILE = "kontrol.csv"   # canlı takibin rastgele seçtiği kontrol hisseleri
 MIN_COMPARE = 10               # uyarı-kontrol kıyası için her gruptan en az kayıt
 LEARN_FILE = "ogrenilen.json"
 MIN_LEARN = 30            # filtre yazmak için en az sonuçlanmış uyarı
 LEARN_BUCKET = 8          # bir filtrenin gerekçesi için koşuldaki en az uyarı
 PATTERN_NAMES = {"ivme": "Hızlı yükseliş", "kirilim": "Dar aralık kırılımı",
-                 "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı", "hacim_oncu": "Hacim öncüsü"}
+                 "geri_donus": "Düşüşten dönüş", "tahta": "Alıcı baskısı", "hacim_oncu": "Hacim öncüsü",
+                 "kirilim_erken": "Erken kırılım"}
 
 
 def fl(x):
@@ -407,6 +410,25 @@ def send_long(text):
         text = text[cut:].lstrip()
 
 
+def down_summary(day_str):
+    """Bugünkü düşüş uyarıları: sonradan gerçekten düştü mü? (%2 daha düşerse doğru, %1,5 yükselirse yanlış)"""
+    rows = [r for r in read_csv(DOWN_FILE) if r.get("date") == day_str]
+    if not rows:
+        return []
+    L = [f"📉 Düşüş uyarıları bugün: {len(rows)} (portföy: {sum(1 for r in rows if r.get('mine'))})"]
+    for k, name in DOWN_NAMES.items():
+        rs = [r for r in rows if r.get("pattern") == k]
+        if not rs:
+            continue
+        ok = sum(1 for r in rs if r.get("outcome") == "dogru")
+        bad = sum(1 for r in rs if r.get("outcome") == "yanlis")
+        ends = [fl(r.get("ret_end")) for r in rs if fl(r.get("ret_end")) is not None]
+        avg_end = f" | gün sonuna doğru ort. %{sum(ends) / len(ends):+.1f}" if ends else ""
+        L.append(f"- {name}: {len(rs)} uyarı | doğru çıkan {ok} | yanlış alarm {bad}{avg_end}")
+    L.append("(Düşüş uyarısı kaydı yeni; güvenilirlik için en az 20–30 uyarı birikmesi gerekir.)")
+    return L
+
+
 def run():
     today = now_tr().date()
     todays_str = str(today)
@@ -482,6 +504,12 @@ def run():
 
     # 3) dersler
     parts.append("\n🎓 Öğrenilenler:\n" + "\n".join(lessons(rows_all)))
+    try:
+        ds = down_summary(todays_str)
+        if ds:
+            parts.append("\n" + "\n".join(ds))
+    except Exception as e:
+        print("düşüş özeti hatası:", repr(e))
     try:
         parts.append("\n" + "\n".join(compare_control(rows_all, read_csv(CONTROL_FILE))))
     except Exception as e:
