@@ -9,6 +9,7 @@ import os
 from cryptography.fernet import Fernet, InvalidToken
 
 FILE = "portfoy_defter.enc"
+GOALS_FILE = "portfoy_hedef.enc"   # ulaşılan portföy kilometre taşları (her biri bir kez kutlanır)
 KEEP_DAYS = 200
 
 
@@ -86,3 +87,26 @@ def diff_text(old, new):
         else:
             lines.append(f"🔁 {s}: {a:,.0f} → {b:,.0f} lot")
     return lines
+
+
+def load_goals():
+    """{ '500000': 'YYYY-MM-DD' } ulaşılmış kilometre taşları. Dosya yoksa boş."""
+    f = _fernet()
+    if f is None:
+        raise ValueError("SNAPSHOT_KEY secret'ı yok")
+    if not os.path.exists(GOALS_FILE):
+        return {}
+    with open(GOALS_FILE, "rb") as fh:
+        raw = fh.read()
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(f.decrypt(raw).decode())
+    except InvalidToken:
+        raise ValueError("SNAPSHOT_KEY yanlış: hedef dosyası açılamadı")
+
+
+def save_goals(goals):
+    f = _fernet()
+    with open(GOALS_FILE, "wb") as fh:
+        fh.write(f.encrypt(json.dumps(goals, sort_keys=True).encode()))
